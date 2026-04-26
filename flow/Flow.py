@@ -1,229 +1,363 @@
+"""
+Flow.py — Network flow tracker.
+
+Accumulates per-packet statistics incrementally, then computes aggregate
+features when the flow is terminated.  All timing values are stored in
+microseconds (µs) to match CICFlowMeter conventions.
+"""
+
+from __future__ import annotations
+
 import statistics
+from datetime import datetime
+from typing import Any
 
 from flow.FlowFeature import FlowFeatures
 
-from datetime import datetime
-threshold = 5
+# A flow is considered "idle" if the gap between consecutive packets
+# exceeds this threshold (seconds).
+IDLE_THRESHOLD: float = 5.0
+
+# Conversion factor: seconds → microseconds
+_US = 1_000_000
 
 
 class Flow:
-    def __init__(self, packet):
-        self.packetInfos = [packet]
-        self.fwdPacketInfos = [packet]
-        self.bwdPacketInfos = []
+    """
+    Represents a single bidirectional network flow.
 
-        self.flowFeatures = FlowFeatures()
-        self.flowFeatures.setDestPort(packet.getDestPort())
+    A flow is identified by its (src_ip, src_port, dst_ip, dst_port, proto)
+    5-tuple.  The first packet always belongs to the forward direction; any
+    packet arriving on the reverse 5-tuple is classified as backward.
 
-        self.flowFeatures.setPID(packet.getPID())
-        self.flowFeatures.setPName(packet.getPName())
+    Usage::
 
+        flow = Flow(first_packet)
+        for pkt in subsequent_packets:
+            flow.new(pkt, direction)   # direction: "fwd" | "bwd"
+        features = flow.terminated()
+    """
 
+    __slots__ = (
+        "features",
+        "_all_packets",
+        "_fwd_packets",
+        "_bwd_packets",
+        "_flow_iat",
+        "_fwd_iat",
+        "_bwd_iat",
+        "_flow_active",
+        "_flow_idle",
+        "_flow_last_seen",
+        "_flow_start_time",
+        "_fwd_last_seen",
+        "_bwd_last_seen",
+        "_start_active_time",
+        "_end_active_time",
+        "_pkt_count",
+        "_fwd_count",
+        "_bwd_count",
+    )
 
-        self.flowFeatures.setFwdPSHFlags(0 if not packet.getURGFlag() else 1)
-        self.flowFeatures.setMaxPacketLen(packet.getPayloadBytes())
-        self.flowFeatures.setPacketLenMean(packet.getPayloadBytes())
-        self.flowFeatures.setFINFlagCount(1 if packet.getFINFlag() else 0)
-        self.flowFeatures.setSYNFlagCount(1 if packet.getSYNFlag() else 0)
-        self.flowFeatures.setPSHFlagCount(1 if packet.getPSHFlag() else 0)
-        self.flowFeatures.setACKFlagCount(1 if packet.getACKFlag() else 0)
-        self.flowFeatures.setURGFlagCount(1 if packet.getURGFlag() else 0)
+    def __init__(self, packet) -> None:
+        ts = packet.getTimestamp()
 
-        self.flowFeatures.setAvgPacketSize(packet.getPacketSize())
-        self.flowFeatures.setInitBytesFwd(packet.getWinBytes())
+        # --- FlowFeatures object ---
+        self.features = FlowFeatures()
+        f = self.features  # local alias for brevity
 
-        self.flowFeatures.setSrc(packet.getSrc())
-        self.flowFeatures.setDest(packet.getDest())
-        self.flowFeatures.setSrcPort(packet.getSrcPort())
-        self.flowFeatures.setProtocol(packet.getProtocol())
+        f.setDestPort(packet.getDestPort())
+        f.setSrc(packet.getSrc())
+        f.setDest(packet.getDest())
+        f.setSrcPort(packet.getSrcPort())
+        f.setProtocol(packet.getProtocol())
+        f.setPID(packet.getPID())
+        f.setPName(packet.getPName())
 
+        # Flag initialisation — forward direction only for first packet
+        # NOTE: original code used getURGFlag() for FwdPSHFlags; preserved.
+        f.setFwdPSHFlags(1 if packet.getURGFlag() else 0)
+        f.setFINFlagCount(1 if packet.getFINFlag() else 0)
+        f.setSYNFlagCount(1 if packet.getSYNFlag() else 0)
+        f.setPSHFlagCount(1 if packet.getPSHFlag() else 0)
+        f.setACKFlagCount(1 if packet.getACKFlag() else 0)
+        f.setURGFlagCount(1 if packet.getURGFlag() else 0)
 
-        self.flowLastSeen = packet.getTimestamp()
-        self.fwdLastSeen = packet.getTimestamp()
-        self.bwdLastSeen = 0
-        self.flowStartTime = packet.getTimestamp()
-        self.startActiveTime = packet.getTimestamp()
-        self.endActiveTime = packet.getTimestamp()
+        payload = packet.getPayloadBytes()
+        f.setMaxPacketLen(payload)
+        f.setPacketLenMean(payload)
+        f.setAvgPacketSize(packet.getPacketSize())
+        f.setInitBytesFwd(packet.getWinBytes())
 
-        self.flowIAT = []
-        self.fwdIAT = []
-        self.bwdIAT = []
-        self.flowActive = []
-        self.flowIdle = []
+        # --- Timing state ---
+        self._flow_start_time: float = ts
+        self._flow_last_seen: float = ts
+        self._fwd_last_seen: float = ts
+        self._bwd_last_seen: float = 0.0
+        self._start_active_time: float = ts
+        self._end_active_time: float = ts
 
-        self.packet_count = 1
-        self.fwd_packet_count = 1
-        self.bwd_packet_count = 0
+        # --- Packet lists (used for aggregate stats at termination) ---
+        self._all_packets = [packet]
+        self._fwd_packets = [packet]
+        self._bwd_packets: list = []
 
-    def getFlowLastSeen(self):
-        return self.flowLastSeen
+        # --- Inter-arrival time accumulators (µs) ---
+        self._flow_iat: list[float] = []
+        self._fwd_iat: list[float] = []
+        self._bwd_iat: list[float] = []
 
-    def getFlowStartTime(self):
-        return self.flowStartTime
+        # --- Active/idle period accumulators (seconds) ---
+        self._flow_active: list[float] = []
+        self._flow_idle: list[float] = []
 
-    def new(self, packetInfo, direction):
-        if direction == 'bwd':
-            self.bwdPacketInfos.append(packetInfo)
+        # --- Counters ---
+        self._pkt_count: int = 1
+        self._fwd_count: int = 1
+        self._bwd_count: int = 0
 
-            if self.bwd_packet_count == 0:
-                # first backward packet, do some initalising
-                self.flowFeatures.setBwdPacketLenMax(packetInfo.getPayloadBytes())
-                self.flowFeatures.setBwdPacketLenMin(packetInfo.getPayloadBytes())
-                self.flowFeatures.setInitWinBytesBwd(packetInfo.getWinBytes())
+    # ------------------------------------------------------------------
+    # Public accessors
+    # ------------------------------------------------------------------
+
+    def getFlowLastSeen(self) -> float:
+        return self._flow_last_seen
+
+    def getFlowStartTime(self) -> float:
+        return self._flow_start_time
+
+    # ------------------------------------------------------------------
+    # Incremental update
+    # ------------------------------------------------------------------
+
+    def new(self, packet, direction: str) -> None:
+        """
+        Incorporate a new packet into the flow.
+
+        Parameters
+        ----------
+        packet:    PacketInfo instance
+        direction: "fwd" (same direction as initiator) or "bwd" (reverse)
+        """
+        ts = packet.getTimestamp()
+        payload = packet.getPayloadBytes()
+        f = self.features
+
+        # ---- Direction-specific bookkeeping ----
+        if direction == "bwd":
+            self._bwd_packets.append(packet)
+            if self._bwd_count == 0:
+                # First backward packet — initialise bwd-only features
+                f.setBwdPacketLenMax(payload)
+                f.setBwdPacketLenMin(payload)
+                f.setInitWinBytesBwd(packet.getWinBytes())
             else:
-                self.flowFeatures.setBwdPacketLenMax(
-                    max(self.flowFeatures.bwd_packet_len_max, packetInfo.getPayloadBytes()))
-                self.flowFeatures.setBwdPacketLenMin(
-                    min(self.flowFeatures.bwd_packet_len_min, packetInfo.getPayloadBytes()))
-                self.bwdIAT.append((packetInfo.getTimestamp() - self.bwdLastSeen) * 1000 * 1000)
+                f.setBwdPacketLenMax(max(f.bwd_packet_len_max, payload))
+                f.setBwdPacketLenMin(min(f.bwd_packet_len_min, payload))
+                self._bwd_iat.append((ts - self._bwd_last_seen) * _US)
+            self._bwd_count += 1
+            self._bwd_last_seen = ts
 
-            self.bwd_packet_count = self.bwd_packet_count + 1
-            self.bwdLastSeen = packetInfo.getTimestamp()
+        else:  # "fwd"
+            self._fwd_packets.append(packet)
+            self._fwd_iat.append((ts - self._fwd_last_seen) * _US)
+            # FwdPSHFlags = max(current, new) — stays 1 once set
+            if packet.getURGFlag():
+                f.setFwdPSHFlags(1)
+            self._fwd_count += 1
+            self._fwd_last_seen = ts
 
+        # ---- Shared per-packet updates ----
+        f.setMaxPacketLen(max(f.getMaxPacketLen(), payload))
+
+        # Flag counts: set to 1 if seen at least once (idempotent)
+        if packet.getFINFlag():
+            f.setFINFlagCount(1)
+        if packet.getSYNFlag():
+            f.setSYNFlagCount(1)
+        if packet.getPSHFlag():
+            f.setPSHFlagCount(1)
+        if packet.getACKFlag():
+            f.setACKFlagCount(1)
+        if packet.getURGFlag():
+            f.setURGFlagCount(1)
+
+        # ---- Active / idle period tracking ----
+        gap = ts - self._end_active_time
+        if gap > IDLE_THRESHOLD:
+            active_duration = self._end_active_time - self._start_active_time
+            if active_duration > 0:
+                self._flow_active.append(active_duration)
+            self._flow_idle.append(gap)
+            self._start_active_time = ts
+            self._end_active_time = ts
         else:
-            self.fwdPacketInfos.append(packetInfo)
-            self.fwdIAT.append((packetInfo.getTimestamp() - self.fwdLastSeen) * 1000 * 1000)
-            self.flowFeatures.setFwdPSHFlags(max(1 if packetInfo.getURGFlag() else 0,
-                                                 self.flowFeatures.getFwdPSHFlags()))
-            self.fwd_packet_count = self.fwd_packet_count + 1
-            self.fwdLastSeen = packetInfo.getTimestamp()
+            self._end_active_time = ts
 
-        self.flowFeatures.setMaxPacketLen(max(self.flowFeatures.getMaxPacketLen(), packetInfo.getPayloadBytes()))
+        # ---- Flow-level IAT ----
+        self._flow_iat.append((ts - self._flow_last_seen) * _US)
+        self._flow_last_seen = ts
 
-        if packetInfo.getFINFlag():
-            self.flowFeatures.setFINFlagCount(1)
-        if packetInfo.getSYNFlag():
-            self.flowFeatures.setSYNFlagCount(1)
-        if packetInfo.getPSHFlag():
-            self.flowFeatures.setPSHFlagCount(1)
-        if packetInfo.getACKFlag():
-            self.flowFeatures.setACKFlagCount(1)
-        if packetInfo.getURGFlag():
-            self.flowFeatures.setURGFlagCount(1)
+        self._all_packets.append(packet)
+        self._pkt_count += 1
 
-        time = packetInfo.getTimestamp()
-        if time - self.endActiveTime > threshold:
-            if self.endActiveTime - self.startActiveTime > 0:
-                self.flowActive.append(self.endActiveTime - self.startActiveTime)
-            self.flowIdle.append(time - self.endActiveTime)
-            self.startActiveTime = time
-            self.endActiveTime = time
-        else:
-            self.endActiveTime = time
+    # ------------------------------------------------------------------
+    # Termination — compute aggregate features and return feature vector
+    # ------------------------------------------------------------------
 
-        self.packet_count = self.packet_count + 1
-        self.packetInfos.append(packetInfo)
-        self.flowIAT.append((packetInfo.getTimestamp() - self.flowLastSeen) * 1000 * 1000)
-        self.flowLastSeen = packetInfo.getTimestamp()
+    def terminated(self) -> list[Any]:
+        """
+        Finalise the flow and return a flat feature vector.
 
-    def terminated(self):
-        duration = (self.flowLastSeen - self.flowStartTime) * 1000 * 1000
-        self.flowFeatures.setFlowDuration(duration)
+        The first 39 elements are numeric ML features (matching AE_FEATURES
+        order); elements 40+ are metadata strings / timestamps.
+        """
+        f = self.features
+        duration = (self._flow_last_seen - self._flow_start_time) * _US
+        f.setFlowDuration(duration)
 
-        bwd_packet_lens = [x.getPayloadBytes() for x in self.bwdPacketInfos]
-        if len(bwd_packet_lens) > 0:
-            self.flowFeatures.setBwdPacketLenMean(statistics.mean(bwd_packet_lens))
-            if len(bwd_packet_lens) > 1:
-                self.flowFeatures.setBwdPacketLenStd(statistics.stdev(bwd_packet_lens))
+        # ---- Backward packet length stats ----
+        bwd_payloads = [p.getPayloadBytes() for p in self._bwd_packets]
+        if bwd_payloads:
+            f.setBwdPacketLenMean(statistics.mean(bwd_payloads))
+            if len(bwd_payloads) > 1:
+                f.setBwdPacketLenStd(statistics.stdev(bwd_payloads))
 
-        if len(self.flowIAT) > 0:
-            self.flowFeatures.setFlowIATMean(statistics.mean(self.flowIAT))
-            self.flowFeatures.setFlowIATMax(max(self.flowIAT))
-            self.flowFeatures.setFlowIATMin(min(self.flowIAT))
-            if len(self.flowIAT) > 1:
-                self.flowFeatures.setFlowIATStd(statistics.stdev(self.flowIAT))
+        # ---- Flow IAT stats ----
+        _set_iat_stats(
+            f.setFlowIATMean,
+            f.setFlowIATStd,
+            f.setFlowIATMax,
+            f.setFlowIATMin,
+            f.setFwdIATTotal,  # unused param — handled separately
+            self._flow_iat,
+            total=False,
+        )
 
-        if len(self.fwdIAT) > 0:
-            self.flowFeatures.setFwdIATTotal(sum(self.fwdIAT))
-            self.flowFeatures.setFwdIATMean(statistics.mean(self.fwdIAT))
-            self.flowFeatures.setFwdIATMax(max(self.fwdIAT))
-            self.flowFeatures.setFwdIATMin(min(self.fwdIAT))
-            if len(self.fwdIAT) > 1:
-                self.flowFeatures.setFwdIATStd(statistics.stdev(self.fwdIAT))
+        # ---- Forward IAT stats ----
+        if self._fwd_iat:
+            f.setFwdIATTotal(sum(self._fwd_iat))
+            f.setFwdIATMean(statistics.mean(self._fwd_iat))
+            f.setFwdIATMax(max(self._fwd_iat))
+            f.setFwdIATMin(min(self._fwd_iat))
+            if len(self._fwd_iat) > 1:
+                f.setFwdIATStd(statistics.stdev(self._fwd_iat))
 
-        if len(self.bwdIAT) > 0:
-            self.flowFeatures.setBwdIATTotal(sum(self.bwdIAT))
-            self.flowFeatures.setBwdIATMean(statistics.mean(self.bwdIAT))
-            self.flowFeatures.setBwdIATMax(max(self.bwdIAT))
-            self.flowFeatures.setBwdIATMin(min(self.bwdIAT))
-            if len(self.bwdIAT) > 1:
-                self.flowFeatures.setBwdIATStd(statistics.stdev(self.bwdIAT))
+        # ---- Backward IAT stats ----
+        if self._bwd_iat:
+            f.setBwdIATTotal(sum(self._bwd_iat))
+            f.setBwdIATMean(statistics.mean(self._bwd_iat))
+            f.setBwdIATMax(max(self._bwd_iat))
+            f.setBwdIATMin(min(self._bwd_iat))
+            if len(self._bwd_iat) > 1:
+                f.setBwdIATStd(statistics.stdev(self._bwd_iat))
 
-        self.flowFeatures.setFwdPackets_s(0 if duration == 0 else self.fwd_packet_count / (duration / (1000 * 1000)))
+        # ---- Packets-per-second (forward) ----
+        duration_s = duration / _US
+        f.setFwdPackets_s(0.0 if duration_s == 0 else self._fwd_count / duration_s)
 
-        packet_lens = [x.getPayloadBytes() for x in self.packetInfos]
-        if len(packet_lens) > 0:
-            self.flowFeatures.setPacketLenMean(statistics.mean(packet_lens))
-            if len(packet_lens) > 1:
-                self.flowFeatures.setPacketLenStd(statistics.stdev(packet_lens))
-                self.flowFeatures.setPacketLenVar(statistics.variance(packet_lens))
+        # ---- All-packet length stats ----
+        all_payloads = [p.getPayloadBytes() for p in self._all_packets]
+        if all_payloads:
+            f.setPacketLenMean(statistics.mean(all_payloads))
+            if len(all_payloads) > 1:
+                f.setPacketLenStd(statistics.stdev(all_payloads))
+                f.setPacketLenVar(statistics.variance(all_payloads))
 
-        packet_sizes =[x.getPacketSize() for x in self.packetInfos]
-        self.flowFeatures.setAvgPacketSize(sum(packet_sizes) / self.packet_count)
+        # ---- Packet size averages ----
+        all_sizes = [p.getPacketSize() for p in self._all_packets]
+        f.setAvgPacketSize(sum(all_sizes) / self._pkt_count)
 
-        if self.bwd_packet_count != 0:
-            self.flowFeatures.setAvgBwdSegmentSize(sum(bwd_packet_lens) / self.bwd_packet_count)
+        if self._bwd_count and bwd_payloads:
+            f.setAvgBwdSegmentSize(sum(bwd_payloads) / self._bwd_count)
 
-        if len(self.flowActive) > 0:
-            self.flowFeatures.setActiveMin(min(self.flowActive))
+        # ---- Active / idle stats ----
+        if self._flow_active:
+            f.setActiveMin(min(self._flow_active))
 
-        if len(self.flowIdle) > 0:
-            self.flowFeatures.setIdleMean(statistics.mean(self.flowIdle))
-            self.flowFeatures.setIdleMax(max(self.flowIdle))
-            self.flowFeatures.setIdleMin(min(self.flowIdle))
-            if len(self.flowIdle) > 1:
-                self.flowFeatures.setIdleStd(statistics.stdev(self.flowIdle))
+        if self._flow_idle:
+            f.setIdleMean(statistics.mean(self._flow_idle))
+            f.setIdleMax(max(self._flow_idle))
+            f.setIdleMin(min(self._flow_idle))
+            if len(self._flow_idle) > 1:
+                f.setIdleStd(statistics.stdev(self._flow_idle))
 
+        # ------------------------------------------------------------------
+        # Return flat feature vector
+        # ------------------------------------------------------------------
         return [
-                self.flowFeatures.getFlowDuration(),
-                self.flowFeatures.getBwdPacketLenMax(),
-                self.flowFeatures.getBwdPacketLenMin(),
-                self.flowFeatures.getBwdPacketLenMean(),
-                self.flowFeatures.getBwdPacketLenStd(),
-                self.flowFeatures.getFlowIATMean(),
-                self.flowFeatures.getFlowIATStd(),
-                self.flowFeatures.getFlowIATMax(),
-                self.flowFeatures.getFlowIATMin(),
-                self.flowFeatures.getFwdIATTotal(),
-                self.flowFeatures.getFwdIATMean(),
-                self.flowFeatures.getFwdIATStd(),
-                self.flowFeatures.getFwdIATMax(),
-                self.flowFeatures.getFwdIATMin(),
-                self.flowFeatures.getBwdIATTotal(),
-                self.flowFeatures.getBwdIATMean(),
-                self.flowFeatures.getBwdIATStd(),
-                self.flowFeatures.getBwdIATMax(),
-                self.flowFeatures.getBwdIATMin(),
-                self.flowFeatures.getFwdPSHFlags(),
-                self.flowFeatures.getFwdPackets_s(),
-                self.flowFeatures.getMaxPacketLen(),
-                self.flowFeatures.getPacketLenMean(),
-                self.flowFeatures.getPacketLenStd(),
-                self.flowFeatures.getPacketLenVar(),
-                self.flowFeatures.getFINFlagCount(),
-                self.flowFeatures.getSYNFlagCount(),
-                self.flowFeatures.getPSHFlagCount(),
-                self.flowFeatures.getACKFlagCount(),
-                self.flowFeatures.getURGFlagCount(),
-                self.flowFeatures.getAvgPacketSize(),
-                self.flowFeatures.getAvgBwdSegmentSize(),
-                self.flowFeatures.getInitWinBytesFwd(),
-                self.flowFeatures.getInitWinBytesBwd(),
-                self.flowFeatures.getActiveMin(),
-                self.flowFeatures.getIdleMean(),
-                self.flowFeatures.getIdleStd(),
-                self.flowFeatures.getIdleMax(),
-                self.flowFeatures.getIdleMin(),
+            # ---- Numeric ML features (indices 0–38) ----
+            f.getFlowDuration(),
+            f.getBwdPacketLenMax(),
+            f.getBwdPacketLenMin(),
+            f.getBwdPacketLenMean(),
+            f.getBwdPacketLenStd(),
+            f.getFlowIATMean(),
+            f.getFlowIATStd(),
+            f.getFlowIATMax(),
+            f.getFlowIATMin(),
+            f.getFwdIATTotal(),
+            f.getFwdIATMean(),
+            f.getFwdIATStd(),
+            f.getFwdIATMax(),
+            f.getFwdIATMin(),
+            f.getBwdIATTotal(),
+            f.getBwdIATMean(),
+            f.getBwdIATStd(),
+            f.getBwdIATMax(),
+            f.getBwdIATMin(),
+            f.getFwdPSHFlags(),
+            f.getFwdPackets_s(),
+            f.getMaxPacketLen(),
+            f.getPacketLenMean(),
+            f.getPacketLenStd(),
+            f.getPacketLenVar(),
+            f.getFINFlagCount(),
+            f.getSYNFlagCount(),
+            f.getPSHFlagCount(),
+            f.getACKFlagCount(),
+            f.getURGFlagCount(),
+            f.getAvgPacketSize(),
+            f.getAvgBwdSegmentSize(),
+            f.getInitWinBytesFwd(),
+            f.getInitWinBytesBwd(),
+            f.getActiveMin(),
+            f.getIdleMean(),
+            f.getIdleStd(),
+            f.getIdleMax(),
+            f.getIdleMin(),
+            # ---- Metadata (indices 39–47) ----
+            f.getSrc(),
+            f.getSrcPort(),
+            f.getDest(),
+            f.getDestPort(),
+            f.getProtocol(),
+            datetime.fromtimestamp(self._flow_start_time),
+            datetime.fromtimestamp(self._flow_last_seen),
+            f.getPName(),
+            f.getPID(),
+        ]
 
-                
-                self.flowFeatures.getSrc(),
-                self.flowFeatures.getSrcPort(),
-                self.flowFeatures.getDest(),
-                self.flowFeatures.getDestPort(),
-                self.flowFeatures.getProtocol(),
-                datetime.fromtimestamp(self.getFlowStartTime()),
-                datetime.fromtimestamp(self.getFlowLastSeen()),
-                
-                self.flowFeatures.getPName(),
-                self.flowFeatures.getPID(),
-                ]
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+
+def _set_iat_stats(
+    set_mean,
+    set_std,
+    set_max,
+    set_min,
+    _unused_total,
+    values: list[float],
+    total: bool = True,
+) -> None:
+    """Set mean/std/max/min on a FlowFeatures object from a list of IAT values."""
+    if not values:
+        return
+    set_mean(statistics.mean(values))
+    set_max(max(values))
+    set_min(min(values))
+    if len(values) > 1:
+        set_std(statistics.stdev(values))

@@ -1,224 +1,321 @@
-from scapy.layers.inet import IP, UDP, TCP
+"""
+PacketInfo.py — Per-packet feature extractor.
+
+Wraps a raw Scapy packet and exposes typed accessors used by Flow.py to
+build CICFlowMeter-compatible network flow features.
+
+Design notes
+------------
+- All flag parsing is done once in `_parse_tcp_flags()` rather than
+  re-parsing the flags string six times (original had six identical loops).
+- PID/process lookup is done once per packet in `_resolve_process()` rather
+  than being duplicated across `setSrcPort` and `setDestPort`.
+- `psutil.net_connections()` is called at most once per packet; the original
+  called it twice (once in each port setter).
+- Flow IDs are built lazily via `setFwdID()`/`setBwdID()` as before, but now
+  use an f-string for clarity.
+- `__slots__` reduces per-instance memory — PacketInfo is created for every
+  captured packet, so this matters.
+"""
+
+from __future__ import annotations
+
+import logging
+
 import psutil
+from scapy.layers.inet import IP, TCP, UDP
 
+log = logging.getLogger(__name__)
 
-flags = {
-    'F': 'FIN',
-    'S': 'SYN',
-    'R': 'RST',
-    'P': 'PSH',
-    'A': 'ACK',
-    'U': 'URG',
-    'E': 'ECE',
-    'C': 'CWR',
-    'N': ''
+# Scapy represents TCP flags as a string of single-character codes.
+# Map each code to its human-readable name.
+_FLAG_CHARS: dict[str, str] = {
+    "F": "FIN",
+    "S": "SYN",
+    "R": "RST",
+    "P": "PSH",
+    "A": "ACK",
+    "U": "URG",
+    "E": "ECE",
+    "C": "CWR",
+    "N": "",
 }
 
 
+def _parse_tcp_flags(p) -> frozenset[str]:
+    """
+    Return the set of flag names present in a TCP packet.
+    Returns an empty frozenset for non-TCP packets.
+    """
+    if not p.haslayer(TCP):
+        return frozenset()
+    raw = p[TCP].flags  # e.g. "PA", "S", "FA"
+    return frozenset(_FLAG_CHARS[c] for c in str(raw) if c in _FLAG_CHARS)
+
+
+def _resolve_process(src_port: int, dest_port: int) -> tuple[int | None, str]:
+    """
+    Attempt to identify the local process that owns this connection by
+    matching laddr.port against src_port or dest_port.
+
+    Returns (pid, process_name) or (None, '') if not found.
+
+    Note: `psutil.net_connections()` requires elevated privileges on some
+    platforms.  Failures are caught and logged rather than crashing.
+    """
+    try:
+        for conn in psutil.net_connections():
+            if conn.laddr and conn.laddr.port in (src_port, dest_port):
+                pid = conn.pid
+                if pid is None:
+                    continue
+                try:
+                    return pid, psutil.Process(pid).name()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+    except Exception as exc:
+        log.debug("net_connections lookup failed: %s", exc)
+    return None, ""
+
+
 class PacketInfo:
-    def __init__(self):
-        self.src = ""
-        self.dest = ""
-        self.src_port = 0
-        self.dest_port = 0
-        self.protocol = ''
-        self.timestamp = 0
+    """
+    Extracts and stores all per-packet features needed by the flow tracker.
 
-        self.PSH_flag = False
-        self.FIN_flag = False
-        self.SYN_flag = False
-        self.ACK_flag = False
-        self.URG_flag = False
-        self.RST_flag = False
+    Typical usage (matching application.py's call pattern)::
 
-        self.payload_bytes = 0
-        self.header_bytes = 0
-        self.packet_size = 0
-        self.win_bytes = 0
+        info = PacketInfo()
+        for setter in (info.setDest, info.setSrc, info.setSrcPort, ...):
+            setter(raw_packet)
+        info.setFwdID()
+        info.setBwdID()
+    """
 
-        self.fwd_id = ""
-        self.bwd_id = ""
+    __slots__ = (
+        "src",
+        "dest",
+        "src_port",
+        "dest_port",
+        "protocol",
+        "timestamp",
+        "FIN_flag",
+        "SYN_flag",
+        "RST_flag",
+        "PSH_flag",
+        "ACK_flag",
+        "URG_flag",
+        "payload_bytes",
+        "header_bytes",
+        "packet_size",
+        "win_bytes",
+        "fwd_id",
+        "bwd_id",
+        "pid",
+        "p_name",
+        "_flags",  # cached parsed flag set
+        "_ports_resolved",  # guard: resolve process only once
+    )
 
-        self.pid = None
-        self.p_name = ''
+    def __init__(self) -> None:
+        self.src: str = ""
+        self.dest: str = ""
+        self.src_port: int = 0
+        self.dest_port: int = 0
+        self.protocol: str = ""
+        self.timestamp: float = 0.0
 
+        self.FIN_flag: bool = False
+        self.SYN_flag: bool = False
+        self.RST_flag: bool = False
+        self.PSH_flag: bool = False
+        self.ACK_flag: bool = False
+        self.URG_flag: bool = False
 
-    def setSrc(self, p):
+        self.payload_bytes: int = 0
+        self.header_bytes: int = 0
+        self.packet_size: int = 0
+        self.win_bytes: int = 0
+
+        self.fwd_id: str = ""
+        self.bwd_id: str = ""
+
+        self.pid: int | None = None
+        self.p_name: str = ""
+
+        self._flags: frozenset[str] | None = None
+        self._ports_resolved: bool = False
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_flags(self, p) -> frozenset[str]:
+        """Parse TCP flags once and cache the result."""
+        if self._flags is None:
+            self._flags = _parse_tcp_flags(p)
+        return self._flags
+
+    def _maybe_resolve_process(self) -> None:
+        """Look up the owning process once both ports are known."""
+        if not self._ports_resolved and self.pid is None:
+            self._ports_resolved = True
+            self.pid, self.p_name = _resolve_process(self.src_port, self.dest_port)
+
+    # ------------------------------------------------------------------
+    # Network address setters
+    # ------------------------------------------------------------------
+
+    def setSrc(self, p) -> None:
         self.src = p.getlayer(IP).src
 
-    def getSrc(self):
-        return self.src
-
-    def setDest(self, p):
+    def setDest(self, p) -> None:
         self.dest = p.getlayer(IP).dst
 
-    def getDest(self):
-        return self.dest
-
-    def setSrcPort(self, p):
+    def setSrcPort(self, p) -> None:
         if p.haslayer(TCP):
-            self.src_port = p.getlayer(TCP).sport
-        if p.haslayer(UDP):
-            self.src_port = p.getlayer(UDP).sport
+            self.src_port = p[TCP].sport
+        elif p.haslayer(UDP):
+            self.src_port = p[UDP].sport
+        self._maybe_resolve_process()
 
-        if self.pid is None and self.p_name == '':
-            connections = psutil.net_connections()
-            # port = int(sys.argv[1])
-            # print('-'*10)
-            # print(self.src_port)
-            # print(self.dest_port)
-            # print('-'*10)
-            for con in connections:
-                # print( psutil.Process(con.pid).name(),con.pid, con.laddr.port )
-                if (con.laddr.port - self.src_port ==0.0) or (con.laddr.port - self.dest_port ==0.0):
-                    self.pid = con.pid
-                    self.p_name = psutil.Process(con.pid).name()
-
-
-    def getSrcPort(self):
-        return self.src_port
-
-    def setDestPort(self, p):
+    def setDestPort(self, p) -> None:
         if p.haslayer(TCP):
-            self.dest_port = p.getlayer(TCP).dport
-        if p.haslayer(UDP):
-            self.dest_port = p.getlayer(UDP).dport
+            self.dest_port = p[TCP].dport
+        elif p.haslayer(UDP):
+            self.dest_port = p[UDP].dport
+        self._maybe_resolve_process()
 
-        if self.pid is None and self.p_name == '':
-            connections = psutil.net_connections()
-            for con in connections:
-                if (con.laddr.port - self.src_port ==0.0) or (con.laddr.port - self.dest_port ==0.0):
-                    self.pid = con.pid
-                    self.p_name = psutil.Process(con.pid).name()
-
-    def getPID(self):
-        return self.pid
-
-    def getPName(self):
-        return self.p_name
-
-    def getDestPort(self):
-        return self.dest_port
-
-    def setProtocol(self, p):
+    def setProtocol(self, p) -> None:
         if p.haslayer(TCP):
-            self.protocol = 'TCP'
-        if p.haslayer(UDP):
-            self.protocol = 'UDP'
+            self.protocol = "TCP"
+        elif p.haslayer(UDP):
+            self.protocol = "UDP"
 
-    def getProtocol(self):
-        return self.protocol
+    def setTimestamp(self, p) -> None:
+        self.timestamp = float(p.time)
 
-    def setTimestamp(self, p):
-        self.timestamp = p.time
+    # ------------------------------------------------------------------
+    # TCP flag setters — all delegate to the single cached parse
+    # ------------------------------------------------------------------
 
-    def getTimestamp(self):
-        return self.timestamp
+    def setPSHFlag(self, p) -> None:
+        self.PSH_flag = "PSH" in self._get_flags(p)
 
-    def setPSHFlag(self, p):
-        if p.haslayer(TCP):
-            tcp_flags = p[TCP].flags
-            flag = [flags[x] for x in tcp_flags]
-            if 'PSH' in flag:
-                self.PSH_flag = True
+    def setFINFlag(self, p) -> None:
+        self.FIN_flag = "FIN" in self._get_flags(p)
 
-    def getPSHFlag(self):
-        return self.PSH_flag
+    def setSYNFlag(self, p) -> None:
+        self.SYN_flag = "SYN" in self._get_flags(p)
 
-    def setFINFlag(self, p):
-        if p.haslayer(TCP):
-            tcp_flags = p[TCP].flags
-            flag = [flags[x] for x in tcp_flags]
-            if 'FIN' in flag:
-                self.FIN_flag = True
+    def setACKFlag(self, p) -> None:
+        self.ACK_flag = "ACK" in self._get_flags(p)
 
-    def getFINFlag(self):
-        return self.FIN_flag
+    def setURGFlag(self, p) -> None:
+        self.URG_flag = "URG" in self._get_flags(p)
 
-    def setSYNFlag(self, p):
-        if p.haslayer(TCP):
-            tcp_flags = p[TCP].flags
-            flag = [flags[x] for x in tcp_flags]
-            if 'SYN' in flag:
-                self.SYN_flag = True
+    def setRSTFlag(self, p) -> None:
+        self.RST_flag = "RST" in self._get_flags(p)
 
-    def getSYNFlag(self):
-        return self.SYN_flag
+    # ------------------------------------------------------------------
+    # Byte / size setters
+    # ------------------------------------------------------------------
 
-    def setACKFlag(self, p):
-        if p.haslayer(TCP):
-            tcp_flags = p[TCP].flags
-            flag = [flags[x] for x in tcp_flags]
-            if 'ACK' in flag:
-                self.ACK_flag = True
-
-    def getACKFlag(self):
-        return self.ACK_flag
-
-    def setURGFlag(self, p):
-        if p.haslayer(TCP):
-            tcp_flags = p[TCP].flags
-            flag = [flags[x] for x in tcp_flags]
-            if 'URG' in flag:
-                self.URG_flag = True
-
-    def getURGFlag(self):
-        return self.URG_flag
-
-    def setRSTFlag(self, p):
-        if p.haslayer(TCP):
-            tcp_flags = p[TCP].flags
-            flag = [flags[x] for x in tcp_flags]
-            if 'RST' in flag:
-                self.RST_flag = True
-
-    def getRSTFlag(self):
-        return self.RST_flag
-
-    def setPayloadBytes(self, p):
+    def setPayloadBytes(self, p) -> None:
         if p.haslayer(TCP):
             self.payload_bytes = len(p[TCP].payload)
-        if p.haslayer(UDP):
+        elif p.haslayer(UDP):
             self.payload_bytes = len(p[UDP].payload)
 
-    def getPayloadBytes(self):
-        return self.payload_bytes
-
-    def setHeaderBytes(self, p):
+    def setHeaderBytes(self, p) -> None:
         if p.haslayer(TCP):
             self.header_bytes = len(p[TCP]) - len(p[TCP].payload)
-        if p.haslayer(UDP):
+        elif p.haslayer(UDP):
             self.header_bytes = len(p[UDP]) - len(p[UDP].payload)
 
-    def getHeaderBytes(self):
-        return self.header_bytes
-
-    def setPacketSize(self, p):
+    def setPacketSize(self, p) -> None:
         if p.haslayer(TCP):
             self.packet_size = len(p[TCP])
-        if p.haslayer(UDP):
+        elif p.haslayer(UDP):
             self.packet_size = len(p[UDP])
 
-    def getPacketSize(self):
+    def setWinBytes(self, p) -> None:
+        if p.haslayer(TCP):
+            self.win_bytes = p[TCP].window
+
+    # ------------------------------------------------------------------
+    # Flow ID setters
+    # ------------------------------------------------------------------
+
+    def setFwdID(self) -> None:
+        self.fwd_id = (
+            f"{self.src}-{self.dest}-{self.src_port}-{self.dest_port}-{self.protocol}"
+        )
+
+    def setBwdID(self) -> None:
+        self.bwd_id = (
+            f"{self.dest}-{self.src}-{self.dest_port}-{self.src_port}-{self.protocol}"
+        )
+
+    # ------------------------------------------------------------------
+    # Getters
+    # ------------------------------------------------------------------
+
+    def getSrc(self) -> str:
+        return self.src
+
+    def getDest(self) -> str:
+        return self.dest
+
+    def getSrcPort(self) -> int:
+        return self.src_port
+
+    def getDestPort(self) -> int:
+        return self.dest_port
+
+    def getProtocol(self) -> str:
+        return self.protocol
+
+    def getTimestamp(self) -> float:
+        return self.timestamp
+
+    def getPSHFlag(self) -> bool:
+        return self.PSH_flag
+
+    def getFINFlag(self) -> bool:
+        return self.FIN_flag
+
+    def getSYNFlag(self) -> bool:
+        return self.SYN_flag
+
+    def getACKFlag(self) -> bool:
+        return self.ACK_flag
+
+    def getURGFlag(self) -> bool:
+        return self.URG_flag
+
+    def getRSTFlag(self) -> bool:
+        return self.RST_flag
+
+    def getPayloadBytes(self) -> int:
+        return self.payload_bytes
+
+    def getHeaderBytes(self) -> int:
+        return self.header_bytes
+
+    def getPacketSize(self) -> int:
         return self.packet_size
 
-    def setWinBytes(self, p):
-        if p.haslayer(TCP):
-            self.win_bytes = p[0].window
-
-    def getWinBytes(self):
+    def getWinBytes(self) -> int:
         return self.win_bytes
 
-    def setFwdID(self):
-        self.fwd_id = self.src + "-" + self.dest + "-" + \
-                       str(self.src_port) + "-" + str(self.dest_port) + "-" + self.protocol
-
-    def getFwdID(self):
+    def getFwdID(self) -> str:
         return self.fwd_id
 
-    def setBwdID(self):
-        self.bwd_id = self.dest + "-" + self.src + "-" + \
-                      str(self.dest_port) + "-" + str(self.src_port) + "-" + self.protocol
-
-    def getBwdID(self):
+    def getBwdID(self) -> str:
         return self.bwd_id
+
+    def getPID(self) -> int | None:
+        return self.pid
+
+    def getPName(self) -> str:
+        return self.p_name

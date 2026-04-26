@@ -1,1102 +1,1150 @@
-from flask_socketio import SocketIO, emit
-from flask_cors import CORS
-from flask import jsonify  # <-- Add this to existing Flask imports
-from flask import Flask, render_template, redirect, url_for, request, session, flash
-from random import random
-from time import sleep
-from threading import Thread, Event
-import os
-import time
+"""
+XAI-FLOWS Network Intrusion Detection System
+Flask + SocketIO backend — production-grade refactor
+"""
+
+from __future__ import annotations
+
 import atexit
-
-# Set working directory to where the application is
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-os.chdir(APP_DIR)
-
-import firebase_admin
-from firebase_admin import credentials, firestore
-from firebase_admin.firestore import SERVER_TIMESTAMP
-from datetime import datetime, timedelta
-from firebase_config import (
-    firestore_db, create_user_session, update_global_stats, 
-    hash_password, verify_password, get_user_by_username, save_malicious_flow, increment_high_risk_count
-)
-from scapy.sendrecv import sniff
-from sklearn.tree import _tree
-
-from flow.Flow import Flow
-from flow.PacketInfo import PacketInfo
-
-import numpy as np
-import pickle
 import csv
-import traceback
-
-import json
-import pandas as pd
-
-from scipy.stats import norm
-
 import ipaddress
+import json
+import logging
+import os
+import pickle
+import time
+from contextlib import contextmanager
+from threading import Event, Lock, Thread
+from typing import Any
 from urllib.request import urlopen
 
+import dill
+import joblib
+import numpy as np
+import pandas as pd
+import plotly
+import warnings
+
+from flask import (
+    Flask,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from flask_cors import CORS
+from flask_socketio import SocketIO
+from sklearn.tree import _tree
+
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("xai-flows")
+
+# ---------------------------------------------------------------------------
+# sklearn backward-compat shim for legacy pickled tree models
+# ---------------------------------------------------------------------------
+try:
+    _orig_check = _tree._check_node_ndarray
+
+    def _compat_check(node_ndarray, expected_dtype):
+        try:
+            return _orig_check(node_ndarray, expected_dtype)
+        except ValueError:
+            if (
+                hasattr(expected_dtype, "names")
+                and "missing_go_to_left" in expected_dtype.names
+                and node_ndarray.dtype.names is not None
+                and "missing_go_to_left" not in node_ndarray.dtype.names
+            ):
+                fixed = np.empty(node_ndarray.shape, dtype=expected_dtype)
+                for name in node_ndarray.dtype.names:
+                    fixed[name] = node_ndarray[name]
+                fixed["missing_go_to_left"] = 0
+                return _orig_check(fixed, expected_dtype)
+            raise
+
+    _tree._check_node_ndarray = _compat_check
+except Exception:
+    pass
+
+# ---------------------------------------------------------------------------
+# Keras — optional
+# ---------------------------------------------------------------------------
 try:
     from tensorflow import keras
 except ImportError:
     keras = None
 
-from lime import lime_tabular
-
-import dill
-
-import joblib
-
-import plotly
-import plotly.graph_objs
-
-import warnings
-warnings.filterwarnings("ignore")
-
-# Compatibility shim for old sklearn DecisionTree/RandomForest pickle formats.
-# Older sklearn tree node dtypes may lack the missing_go_to_left field used by
-# newer scikit-learn versions, so we patch the internal dtype checker to fill
-# the missing field when loading legacy pickles.
-try:
-    _orig_check_node_ndarray = _tree._check_node_ndarray
-    def _compatible_check_node_ndarray(node_ndarray, expected_dtype):
-        try:
-            return _orig_check_node_ndarray(node_ndarray, expected_dtype)
-        except ValueError:
-            if (
-                hasattr(expected_dtype, 'names') and
-                'missing_go_to_left' in expected_dtype.names and
-                node_ndarray.dtype.names is not None and
-                'missing_go_to_left' not in node_ndarray.dtype.names
-            ):
-                fixed = np.empty(node_ndarray.shape, dtype=expected_dtype)
-                for name in node_ndarray.dtype.names:
-                    fixed[name] = node_ndarray[name]
-                fixed['missing_go_to_left'] = 0
-                return _orig_check_node_ndarray(fixed, expected_dtype)
-            raise
-    _tree._check_node_ndarray = _compatible_check_node_ndarray
-except Exception:
-    pass
-
-
-def ipInfo(addr=''):
-    try:
-        if addr == '':
-            url = 'https://ipinfo.io/json'
-        else:
-            url = 'https://ipinfo.io/' + addr + '/json'
-        res = urlopen(url, timeout=5)  # Added timeout
-        data = json.load(res)
-        return data.get('country', None)  # Using get() with default
-    except Exception:
-        return None
-
-__author__ = 'rnids'
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(APP_DIR)
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'secret!')  # Added env var support
-app.config['DEBUG'] = True  # Enable for live reload
+app.config["SECRET_KEY"] = (
+    os.environ.get("FLASK_SECRET_KEY")
+)  # see helper below
+app.config["DEBUG"] = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
 
-# Test flag - set to True to generate fake data for testing
-TEST_MODE = True
 
-# Enable CORS for Flask app
+def _missing_key():  # called only when env var absent — fail loudly
+    key = os.urandom(32).hex()
+    log.warning(
+        "FLASK_SECRET_KEY not set — generated ephemeral key. "
+        "Sessions will not survive restart. Set the env var in production."
+    )
+    return key
+
+
+app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY") or _missing_key()
+
 CORS(app)
+socketio = SocketIO(
+    app,
+    async_mode=None,
+    logger=False,  # set True only when debugging Socket.IO
+    engineio_logger=False,
+    cors_allowed_origins="*",
+)
+
+# ---------------------------------------------------------------------------
+# Feature column definitions
+# ---------------------------------------------------------------------------
+FLOW_COLS = [
+    "FlowID",
+    "FlowDuration",
+    "BwdPacketLenMax",
+    "BwdPacketLenMin",
+    "BwdPacketLenMean",
+    "BwdPacketLenStd",
+    "FlowIATMean",
+    "FlowIATStd",
+    "FlowIATMax",
+    "FlowIATMin",
+    "FwdIATTotal",
+    "FwdIATMean",
+    "FwdIATStd",
+    "FwdIATMax",
+    "FwdIATMin",
+    "BwdIATTotal",
+    "BwdIATMean",
+    "BwdIATStd",
+    "BwdIATMax",
+    "BwdIATMin",
+    "FwdPSHFlags",
+    "FwdPackets_s",
+    "MaxPacketLen",
+    "PacketLenMean",
+    "PacketLenStd",
+    "PacketLenVar",
+    "FINFlagCount",
+    "SYNFlagCount",
+    "PSHFlagCount",
+    "ACKFlagCount",
+    "URGFlagCount",
+    "AvgPacketSize",
+    "AvgBwdSegmentSize",
+    "InitWinBytesFwd",
+    "InitWinBytesBwd",
+    "ActiveMin",
+    "IdleMean",
+    "IdleStd",
+    "IdleMax",
+    "IdleMin",
+    "Src",
+    "SrcPort",
+    "Dest",
+    "DestPort",
+    "Protocol",
+    "FlowStartTime",
+    "FlowLastSeen",
+    "PName",
+    "PID",
+    "Classification",
+    "Probability",
+    "Risk",
+]
+
+AE_FEATURES = np.array(
+    [
+        "FlowDuration",
+        "BwdPacketLengthMax",
+        "BwdPacketLengthMin",
+        "BwdPacketLengthMean",
+        "BwdPacketLengthStd",
+        "FlowIATMean",
+        "FlowIATStd",
+        "FlowIATMax",
+        "FlowIATMin",
+        "FwdIATTotal",
+        "FwdIATMean",
+        "FwdIATStd",
+        "FwdIATMax",
+        "FwdIATMin",
+        "BwdIATTotal",
+        "BwdIATMean",
+        "BwdIATStd",
+        "BwdIATMax",
+        "BwdIATMin",
+        "FwdPSHFlags",
+        "FwdPackets/s",
+        "PacketLengthMax",
+        "PacketLengthMean",
+        "PacketLengthStd",
+        "PacketLengthVariance",
+        "FINFlagCount",
+        "SYNFlagCount",
+        "PSHFlagCount",
+        "ACKFlagCount",
+        "URGFlagCount",
+        "AveragePacketSize",
+        "BwdSegmentSizeAvg",
+        "FWDInitWinBytes",
+        "BwdInitWinBytes",
+        "ActiveMin",
+        "IdleMean",
+        "IdleStd",
+        "IdleMax",
+        "IdleMin",
+    ]
+)
+
+# Risk thresholds
+RISK_LEVELS = [
+    (0.8, "very_high", "Very High"),
+    (0.6, "high", "High"),
+    (0.4, "medium", "Medium"),
+    (0.2, "low", "Low"),
+    (0.0, "minimal", "Minimal"),
+]
 
 
+# ---------------------------------------------------------------------------
+# Model loading — fail fast with clear errors
+# ---------------------------------------------------------------------------
+def load_models() -> dict:
+    models: dict[str, Any] = {}
 
+    models["ae_scaler"] = joblib.load("models/preprocess_pipeline_AE_39ft.save")
 
-# Turn the Flask app into a SocketIO app
-socketio = SocketIO(app, async_mode=None, logger=True, engineio_logger=True, cors_allowed_origins="*")
-
-# Random result Generator Thread
-thread = Thread()
-thread_stop_event = Event()
-
-f = open("output_logs.csv", 'w')
-w = csv.writer(f)
-f2 = open("input_logs.csv", 'w')
-w2 = csv.writer(f2)
-
-# Add file cleanup
-def cleanup_files():
-    if not f.closed:
-        f.close()
-    if not f2.closed:
-        f2.close()
-
-atexit.register(cleanup_files)
-
-cols = ['FlowID',
-'FlowDuration',
-'BwdPacketLenMax',
-'BwdPacketLenMin',
-'BwdPacketLenMean',
-'BwdPacketLenStd',
-'FlowIATMean',
-'FlowIATStd',
-'FlowIATMax',
-'FlowIATMin',
-'FwdIATTotal',
-'FwdIATMean',
-'FwdIATStd',
-'FwdIATMax',
-'FwdIATMin',
-'BwdIATTotal',
-'BwdIATMean',
-'BwdIATStd',
-'BwdIATMax',
-'BwdIATMin',
-'FwdPSHFlags',
-'FwdPackets_s',
-'MaxPacketLen',
-'PacketLenMean',
-'PacketLenStd',
-'PacketLenVar',
-'FINFlagCount',
-'SYNFlagCount',
-'PSHFlagCount',
-'ACKFlagCount',
-'URGFlagCount',
-'AvgPacketSize',
-'AvgBwdSegmentSize',
-'InitWinBytesFwd',
-'InitWinBytesBwd',
-'ActiveMin',
-'IdleMean',
-'IdleStd',
-'IdleMax',
-'IdleMin',
-'Src',
-'SrcPort',
-'Dest',
-'DestPort',
-'Protocol',
-'FlowStartTime',
-'FlowLastSeen',
-'PName',
-'PID',
-'Classification',
-'Probability',
-'Risk']
-
-ae_features = np.array(['FlowDuration',
-'BwdPacketLengthMax',
-'BwdPacketLengthMin',
-'BwdPacketLengthMean',
-'BwdPacketLengthStd',
-'FlowIATMean',
-'FlowIATStd',
-'FlowIATMax',
-'FlowIATMin',
-'FwdIATTotal',
-'FwdIATMean',
-'FwdIATStd',
-'FwdIATMax',
-'FwdIATMin',
-'BwdIATTotal',
-'BwdIATMean',
-'BwdIATStd',
-'BwdIATMax',
-'BwdIATMin',
-'FwdPSHFlags',
-'FwdPackets/s',
-'PacketLengthMax',
-'PacketLengthMean',
-'PacketLengthStd',
-'PacketLengthVariance',
-'FINFlagCount',
-'SYNFlagCount',
-'PSHFlagCount',
-'ACKFlagCount',
-'URGFlagCount',
-'AveragePacketSize',
-'BwdSegmentSizeAvg',
-'FWDInitWinBytes',
-'BwdInitWinBytes',
-'ActiveMin',
-'IdleMean',
-'IdleStd',
-'IdleMax',
-'IdleMin'])
-
-flow_count = 0
-flow_df = pd.DataFrame(columns=cols)
-
-src_ip_dict = {}
-
-current_flows = {}
-FlowTimeout = 600
-
-# Load models
-try:
-    ae_scaler = joblib.load("models/preprocess_pipeline_AE_39ft.save")
-    # Load autoencoder model - try different approaches for different Keras versions
-    try:
-        ae_model = keras.models.load_model('models/autoencoder_39ft.hdf5')
-    except Exception:
+    if keras is not None:
         try:
-            # Try loading without any compilation
-            ae_model = keras.models.load_model('models/autoencoder_39ft.hdf5', compile=False)
-            # Get loss function - handle different Keras versions
+            models["ae_model"] = keras.models.load_model("models/autoencoder_39ft.hdf5")
+        except Exception:
             try:
-                loss_fn = keras.losses.mse
-            except AttributeError:
-                loss_fn = 'mse'
-            ae_model.compile(optimizer='adam', loss=loss_fn)
-        except Exception as e2:
-            print(f"Could not load autoencoder: {e2}")
-            ae_model = None  # Skip autoencoder analysis if it fails
-    with open('models/model.pkl', 'rb') as f:
-        classifier = pickle.load(f)
-    with open('models/explainer', 'rb') as f:
-        explainer = dill.load(f)
-    predict_fn_rf = lambda x: classifier.predict_proba(x).astype(float)
-except Exception as e:
-    print(f"Error loading models: {str(e)}")
+                m = keras.models.load_model(
+                    "models/autoencoder_39ft.hdf5", compile=False
+                )
+                m.compile(optimizer="adam", loss="mse")
+                models["ae_model"] = m
+            except Exception as exc:
+                log.warning("Autoencoder unavailable: %s", exc)
+                models["ae_model"] = None
+    else:
+        models["ae_model"] = None
+
+    with open("models/model.pkl", "rb") as fh:
+        models["classifier"] = pickle.load(fh)
+
+    with open("models/explainer", "rb") as fh:
+        models["explainer"] = dill.load(fh)
+
+    return models
+
+
+try:
+    MODELS = load_models()
+except Exception as exc:
+    log.critical("Failed to load models: %s", exc)
     raise
 
-def clean_stale_flows():
-    current_time = time.time()
-    stale_flow_ids = []
-    
-    for flow_id, flow in current_flows.items():
-        if (current_time - flow.getFlowLastSeen()) > FlowTimeout:
-            stale_flow_ids.append(flow_id)
-    
-    for flow_id in stale_flow_ids:
-        classify(current_flows[flow_id].terminated())
-        del current_flows[flow_id]
 
-# In application.py - modify the classify function
+def predict_proba(X):
+    return MODELS["classifier"].predict_proba(X).astype(float)
 
-def classify(features):
+
+# ---------------------------------------------------------------------------
+# Firebase / Firestore — imported lazily so app starts without it
+# ---------------------------------------------------------------------------
+from firebase_admin.firestore import SERVER_TIMESTAMP
+from firebase_config import (
+    create_user_session,
+    firestore_db,
+    get_user_by_username,
+    hash_password,
+    increment_high_risk_count,
+    save_malicious_flow,
+    update_global_stats,
+    verify_password,
+)
+
+# ---------------------------------------------------------------------------
+# Packet capture imports
+# ---------------------------------------------------------------------------
+from scapy.sendrecv import sniff as scapy_sniff
+
+from flow.Flow import Flow
+from flow.PacketInfo import PacketInfo
+
+from lime import lime_tabular  # noqa: F401 — needed by dill-loaded explainer
+
+# ---------------------------------------------------------------------------
+# Application state (all guarded by locks)
+# ---------------------------------------------------------------------------
+_state_lock = Lock()
+_flow_count = 0
+_flow_df = pd.DataFrame(columns=FLOW_COLS)
+_src_ip_dict: dict[str, int] = {}
+_current_flows: dict[str, Flow] = {}
+_pending_firestore: list[dict] = []  # flows queued from bg thread for main-thread write
+
+FLOW_TIMEOUT = 600
+TEST_MODE = os.environ.get("TEST_MODE", "true").lower() == "true"
+
+_thread: Thread = Thread()
+_thread_stop = Event()
+
+# ---------------------------------------------------------------------------
+# CSV logging — context-managed, one open/close per session
+# ---------------------------------------------------------------------------
+_output_log = open("output_logs.csv", "w", newline="")
+_input_log = open("input_logs.csv", "w", newline="")
+_output_writer = csv.writer(_output_log)
+_input_writer = csv.writer(_input_log)
+_csv_lock = Lock()
+
+
+def _close_logs():
+    for fh in (_output_log, _input_log):
+        if not fh.closed:
+            fh.close()
+
+
+atexit.register(_close_logs)
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+def _risk_for_score(proba_risk: float) -> tuple[str, str]:
+    """Return (risk_level, risk_label) for a given combined risk probability."""
+    for threshold, level, label in RISK_LEVELS:
+        if proba_risk > threshold:
+            return level, label
+    return "minimal", "Minimal"
+
+
+def _flag_img(country: str | None, is_private: bool) -> str:
+    if is_private:
+        return '<img src="static/images/lan.gif" height="11px" style="margin-bottom:0" title="LAN">'
+    if country and country not in ("ano", "unknown"):
+        c = country.lower()
+        return f'<img src="static/images/blank.gif" class="flag flag-{c}" title="{country}">'
+    return (
+        '<img src="static/images/blank.gif" class="flag flag-unknown" title="UNKNOWN">'
+    )
+
+
+_ip_country_cache: dict[str, str | None] = {}
+
+
+def ip_country(addr: str) -> str | None:
+    if addr in _ip_country_cache:
+        return _ip_country_cache[addr]
     try:
-        global flow_count
-        feature_string = [str(i) for i in features[39:]]
-        record = features.copy()
-        features = [np.nan if x in [np.inf, -np.inf] else float(x) for x in features[:39]]
-        
-        if feature_string[0] in src_ip_dict.keys():
-            src_ip_dict[feature_string[0]] += 1
+        url = f"https://ipinfo.io/{addr}/json" if addr else "https://ipinfo.io/json"
+        with urlopen(url, timeout=5) as res:
+            data = json.load(res)
+        result = data.get("country")
+    except Exception:
+        result = None
+    _ip_country_cache[addr] = result
+    return result
+
+
+def _is_ajax() -> bool:
+    return (
+        request.headers.get("X-Requested-With") == "XMLHttpRequest" or request.is_json
+    )
+
+
+def _clean_for_firestore(d: dict) -> dict:
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, (np.integer, np.int64)):
+            out[k] = int(v)
+        elif isinstance(v, (np.floating, np.float64, np.float32)):
+            out[k] = float(v)
+        elif isinstance(v, np.ndarray):
+            out[k] = v.tolist()
+        elif isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+            out[k] = None
         else:
-            src_ip_dict[feature_string[0]] = 1
-
-        for i in [0,2]:
-            ip = feature_string[i]
-            if not ipaddress.ip_address(ip).is_private:
-                country = ipInfo(ip)
-                if country is not None and country not in ['ano', 'unknown']:
-                    img = ' <img src="static/images/blank.gif" class="flag flag-' + country.lower() + '" title="' + country + '">'
-                else:
-                    img = ' <img src="static/images/blank.gif" class="flag flag-unknown" title="UNKNOWN">'
-            else:
-                img = ' <img src="static/images/lan.gif" height="11px" style="margin-bottom: 0px" title="LAN">'
-            feature_string[i] += img
-
-        if np.nan in features:
-            return
-
-        result = classifier.predict([features])
-        proba = predict_fn_rf([features])
-        proba_score = [proba[0].max()]
-        proba_risk = sum(list(proba[0,1:]))
-        
-        # Determine risk level
-        if proba_risk > 0.8:
-            risk = ["<p class='risk-badge risk-very_high'>Very High</p>"]
-            risk_level = "very_high"
-        elif proba_risk > 0.6:
-            risk = ["<p class='risk-badge risk-high'>High</p>"]
-            risk_level = "high"
-        elif proba_risk > 0.4:
-            risk = ["<p class='risk-badge risk-medium'>Medium</p>"]
-            risk_level = "medium"
-        elif proba_risk > 0.2:
-            risk = ["<p class='risk-badge risk-low'>Low</p>"]
-            risk_level = "low"
-        else:
-            risk = ["<p class='risk-badge risk-minimal'>Minimal</p>"]
-            risk_level = "minimal"
-
-        classification = [str(result[0])]
-        if result[0] != 'Benign':
-            print(feature_string + classification + proba_score)
-
-        flow_count += 1
-        w.writerow(['Flow #'+str(flow_count)])
-        w.writerow(['Flow info:'] + feature_string)
-        w.writerow(['Flow features:'] + features)
-        w.writerow(['Prediction:'] + classification + proba_score)
-        w.writerow(['--------------------------------------------------------------------------------------------------'])
-
-        w2.writerow(['Flow #'+str(flow_count)])
-        w2.writerow(['Flow info:'] + features)
-        w2.writerow(['--------------------------------------------------------------------------------------------------'])
-        
-        # Create flow data dictionary with the risk_level included
-        flow_data = dict(zip(cols, [flow_count] + record + classification + proba_score))
-        # Add risk level explicitly - FIXED: This was missing in original code
-        flow_data['risk_level'] = risk_level
-        
-        # Update the dataframe for local tracking
-        flow_df.loc[len(flow_df)] = [flow_count] + record + classification + proba_score + risk
-        
-        # FIXED: Improved condition to store flows - either non-benign or high/very high risk
-        should_store = result[0] != 'Benign' or risk_level in ["very_high", "high"]
-        
-        if should_store and session.get('user_id'):
             try:
-                print(f"🔍 Saving flow #{flow_count} to Firestore: Class={result[0]}, Risk={risk_level}")
-                
-                # Clean flow data for Firestore storage
-                clean_flow_data = {}
-                for key, value in flow_data.items():
-                    if isinstance(value, (np.integer, np.int64)):
-                        clean_flow_data[key] = int(value)
-                    elif isinstance(value, (np.float64, np.float32)):
-                        clean_flow_data[key] = float(value)
-                    elif isinstance(value, np.ndarray):
-                        clean_flow_data[key] = value.tolist()
-                    elif pd.isna(value):
-                        clean_flow_data[key] = None
-                    else:
-                        clean_flow_data[key] = value
-                
-                # Get session info
-                user_id = session.get('user_id', 'anonymous')
-                session_id = session.get('session_id', 'default_session')
-                
-                # FIXED: Save to Firestore with proper data
-                flow_id = save_malicious_flow(
-                    user_id=user_id,
-                    session_id=session_id,
-                    flow_data=clean_flow_data
-                )
-                
-                if flow_id:
-                    print(f"✅ Saved malicious flow {flow_id} (Risk: {risk_level}, Class: {result[0]})")
-                    
-                    # FIXED: Also increment the session risk counter directly
-                    # This is a backup in case save_malicious_flow's counter update fails
-                    increment_high_risk_count(session_id, risk_level)
-                    
-                    # Update global stats more frequently for high risk flows
-                    if risk_level in ["high", "very_high"] or flow_count % 3 == 0:
-                        update_global_stats()
-                else:
-                    print("❌ Failed to save flow to Firestore")
-                
-            except Exception as e:
-                print(f"❌ Firestore save error: {e}")
-                traceback.print_exc()
+                if pd.isna(v):
+                    out[k] = None
+                    continue
+            except (TypeError, ValueError):
+                pass
+            out[k] = v
+    return out
 
-        ip_data = {'SourceIP': list(src_ip_dict.keys()), 'count': list(src_ip_dict.values())}
-        ip_data = pd.DataFrame(ip_data)
-        ip_data = ip_data.to_json(orient='records')
 
-        socketio.emit('newresult', {
-            'result': [flow_count] + feature_string + classification + proba_score + risk,
-            'ips': json.loads(ip_data),
-            'risk_level': risk_level,
-            'classification': classification[0]  # Use first element of classification
-        }, namespace='/test')
-        
-        return [flow_count] + record + classification + proba_score + risk
-        
-    except Exception as e:
-        print(f"Error in classify function: {str(e)}")
-        traceback.print_exc()
+# ---------------------------------------------------------------------------
+# Core classification logic
+# ---------------------------------------------------------------------------
+
+
+def classify(features: list) -> list | None:
+    """
+    Classify a completed network flow.
+
+    features[:39]  — numeric ML features
+    features[39:]  — metadata strings [src_ip, src_port, dst_ip, dst_port, proto, ...]
+    """
+    try:
+        global _flow_count
+
+        numeric = [
+            np.nan if x in (np.inf, -np.inf) else float(x) for x in features[:39]
+        ]
+        if np.nan in numeric:
+            return None  # incomplete flow — skip
+
+        meta = [str(x) for x in features[39:]]
+        record = features.copy()
+
+        # --- IP annotation (display only) ---
+        annotated_meta = list(meta)
+        for idx in (0, 2):
+            ip = meta[idx]
+            try:
+                private = ipaddress.ip_address(ip).is_private
+            except ValueError:
+                private = True
+            country = None if private else ip_country(ip)
+            annotated_meta[idx] = ip + " " + _flag_img(country, private)
+
+        # --- Source IP tracking ---
+        with _state_lock:
+            src = meta[0]
+            _src_ip_dict[src] = _src_ip_dict.get(src, 0) + 1
+            _flow_count += 1
+            flow_id = _flow_count
+
+        # --- Inference ---
+        result = MODELS["classifier"].predict([numeric])
+        proba = predict_proba([numeric])
+        proba_max = float(proba[0].max())
+        proba_risk = float(sum(proba[0, 1:]))
+
+        classification = str(result[0])
+        risk_level, risk_label = _risk_for_score(proba_risk)
+        risk_html = f"<p class='risk-badge risk-{risk_level}'>{risk_label}</p>"
+
+        # --- CSV logging (thread-safe) ---
+        with _csv_lock:
+            _output_writer.writerow([f"Flow #{flow_id}"])
+            _output_writer.writerow(["Flow info:"] + annotated_meta)
+            _output_writer.writerow(["Flow features:"] + numeric)
+            _output_writer.writerow(["Prediction:", classification, proba_max])
+            _output_writer.writerow(["-" * 80])
+            _input_writer.writerow([f"Flow #{flow_id}"])
+            _input_writer.writerow(["Flow features:"] + numeric)
+            _input_writer.writerow(["-" * 80])
+
+        if classification != "Benign":
+            log.info(
+                "Flow #%d classified as %s (risk=%s)",
+                flow_id,
+                classification,
+                risk_level,
+            )
+
+        # --- DataFrame update ---
+        row = [flow_id] + record + [classification, proba_max, risk_html]
+        with _state_lock:
+            _flow_df.loc[len(_flow_df)] = row
+
+        # --- Firestore (only from request context; queue otherwise) ---
+        should_store = classification != "Benign" or risk_level in ("high", "very_high")
+        if should_store:
+            flow_data = dict(zip(FLOW_COLS, row))
+            flow_data["risk_level"] = risk_level
+            _queue_firestore_write(flow_data, risk_level)
+
+        # --- Emit to frontend ---
+        with _state_lock:
+            ip_records = [
+                {"SourceIP": ip, "count": cnt} for ip, cnt in _src_ip_dict.items()
+            ]
+
+        socketio.emit(
+            "newresult",
+            {
+                "result": [flow_id]
+                + annotated_meta
+                + [classification, proba_max, risk_html],
+                "ips": ip_records,
+                "risk_level": risk_level,
+                "classification": classification,
+            },
+            namespace="/test",
+        )
+
+        return [flow_id] + record + [classification, proba_max, risk_html]
+
+    except Exception:
+        log.exception("Error in classify()")
         return None
 
-def newPacket(p):
+
+def _queue_firestore_write(flow_data: dict, risk_level: str) -> None:
+    """
+    Firestore writes must happen with a user/session context.
+    We store pending writes and flush them on the next HTTP request.
+    This avoids accessing Flask session from background threads.
+    """
+    with _state_lock:
+        _pending_firestore.append({"data": flow_data, "risk_level": risk_level})
+
+
+def _flush_firestore_queue() -> None:
+    """Call this from a request context to drain the pending write queue."""
+    with _state_lock:
+        batch = _pending_firestore.copy()
+        _pending_firestore.clear()
+
+    if not batch or not session.get("user_id"):
+        return
+
+    user_id = session["user_id"]
+    session_id = session.get("session_id", "default_session")
+
+    for item in batch:
+        try:
+            clean = _clean_for_firestore(item["data"])
+            flow_id = save_malicious_flow(
+                user_id=user_id, session_id=session_id, flow_data=clean
+            )
+            if flow_id:
+                increment_high_risk_count(session_id, item["risk_level"])
+                log.debug("Saved flow %s to Firestore", flow_id)
+            else:
+                log.warning("save_malicious_flow returned None")
+        except Exception:
+            log.exception("Firestore write error")
+
+    try:
+        update_global_stats()
+    except Exception:
+        log.exception("update_global_stats failed")
+
+
+# ---------------------------------------------------------------------------
+# Packet capture
+# ---------------------------------------------------------------------------
+
+
+def _handle_packet(p) -> None:
     try:
         packet = PacketInfo()
-        packet.setDest(p)
-        packet.setSrc(p)
-        packet.setSrcPort(p)
-        packet.setDestPort(p)
-        packet.setProtocol(p)
-        packet.setTimestamp(p)
-        packet.setPSHFlag(p)
-        packet.setFINFlag(p)
-        packet.setSYNFlag(p)
-        packet.setACKFlag(p)
-        packet.setURGFlag(p)
-        packet.setRSTFlag(p)
-        packet.setPayloadBytes(p)
-        packet.setHeaderBytes(p)
-        packet.setPacketSize(p)
-        packet.setWinBytes(p)
+        for setter in (
+            packet.setDest,
+            packet.setSrc,
+            packet.setSrcPort,
+            packet.setDestPort,
+            packet.setProtocol,
+            packet.setTimestamp,
+            packet.setPSHFlag,
+            packet.setFINFlag,
+            packet.setSYNFlag,
+            packet.setACKFlag,
+            packet.setURGFlag,
+            packet.setRSTFlag,
+            packet.setPayloadBytes,
+            packet.setHeaderBytes,
+            packet.setPacketSize,
+            packet.setWinBytes,
+        ):
+            setter(p)
         packet.setFwdID()
         packet.setBwdID()
 
-        if packet.getFwdID() in current_flows.keys():
-            flow = current_flows[packet.getFwdID()]
+        fwd_id = packet.getFwdID()
+        bwd_id = packet.getBwdID()
+        now = packet.getTimestamp()
+        fin_rst = packet.getFINFlag() or packet.getRSTFlag()
 
-            if (packet.getTimestamp() - flow.getFlowLastSeen()) > FlowTimeout:
-                classify(flow.terminated())
-                del current_flows[packet.getFwdID()]
-                flow = Flow(packet)
-                current_flows[packet.getFwdID()] = flow
+        with _state_lock:
+            if fwd_id in _current_flows:
+                flow = _current_flows[fwd_id]
+                if (now - flow.getFlowLastSeen()) > FLOW_TIMEOUT:
+                    classify(flow.terminated())
+                    del _current_flows[fwd_id]
+                    _current_flows[fwd_id] = Flow(packet)
+                elif fin_rst:
+                    flow.new(packet, "fwd")
+                    classify(flow.terminated())
+                    del _current_flows[fwd_id]
+                else:
+                    flow.new(packet, "fwd")
 
-            elif packet.getFINFlag() or packet.getRSTFlag():
-                flow.new(packet, 'fwd')
-                classify(flow.terminated())
-                del current_flows[packet.getFwdID()]
-                del flow
-
+            elif bwd_id in _current_flows:
+                flow = _current_flows[bwd_id]
+                if (now - flow.getFlowLastSeen()) > FLOW_TIMEOUT:
+                    classify(flow.terminated())
+                    del _current_flows[bwd_id]
+                    _current_flows[fwd_id] = Flow(packet)
+                elif fin_rst:
+                    flow.new(packet, "bwd")
+                    classify(flow.terminated())
+                    del _current_flows[bwd_id]
+                else:
+                    flow.new(packet, "bwd")
             else:
-                flow.new(packet, 'fwd')
-                current_flows[packet.getFwdID()] = flow
-
-        elif packet.getBwdID() in current_flows.keys():
-            flow = current_flows[packet.getBwdID()]
-
-            if (packet.getTimestamp() - flow.getFlowLastSeen()) > FlowTimeout:
-                classify(flow.terminated())
-                del current_flows[packet.getBwdID()]
-                del flow
-                flow = Flow(packet)
-                current_flows[packet.getFwdID()] = flow
-
-            elif packet.getFINFlag() or packet.getRSTFlag():
-                flow.new(packet, 'bwd')
-                classify(flow.terminated())
-                del current_flows[packet.getBwdID()]
-                del flow
-            else:
-                flow.new(packet, 'bwd')
-                current_flows[packet.getBwdID()] = flow
-        else:
-            flow = Flow(packet)
-            current_flows[packet.getFwdID()] = flow
+                _current_flows[fwd_id] = Flow(packet)
 
     except AttributeError:
-        # Not IP or TCP
-        return
+        pass  # not IP/TCP
+    except Exception:
+        log.exception("Error processing packet")
 
-    except Exception as e:
-        print(f"Error in newPacket function: {str(e)}")
-        traceback.print_exc()
 
-def snif_and_detect():
-    print("=== SNIF_AND_DETECT STARTED ===", flush=True)
-    while not thread_stop_event.isSet():
+def _evict_stale_flows() -> None:
+    now = time.time()
+    with _state_lock:
+        stale = [
+            fid
+            for fid, flow in _current_flows.items()
+            if (now - flow.getFlowLastSeen()) > FLOW_TIMEOUT
+        ]
+        for fid in stale:
+            try:
+                classify(_current_flows[fid].terminated())
+            except Exception:
+                pass
+            del _current_flows[fid]
+
+
+def _sniff_loop() -> None:
+    log.info("Sniff/detect loop started (TEST_MODE=%s)", TEST_MODE)
+    while not _thread_stop.is_set():
         if TEST_MODE:
-            # TEST MODE: Send fake data
-            print(">>> EMITTING TEST DATA...", flush=True)
-            socketio.emit('newresult', {
-                'result': [1, '192.168.1.1', '80', '10.0.0.1', '443', 'tcp', 'Benign', '0.1'],
-                'ips': [{'SourceIP': '192.168.1.1', 'count': 5}],
-                'risk_level': 'minimal',
-                'classification': 'Benign'
-            }, namespace='/test')
-            print(">>> TEST DATA EMITTED", flush=True)
+            socketio.emit(
+                "newresult",
+                {
+                    "result": [
+                        1,
+                        "192.168.1.1",
+                        "80",
+                        "10.0.0.1",
+                        "443",
+                        "tcp",
+                        "Benign",
+                        "0.1",
+                    ],
+                    "ips": [{"SourceIP": "192.168.1.1", "count": 5}],
+                    "risk_level": "minimal",
+                    "classification": "Benign",
+                },
+                namespace="/test",
+            )
             time.sleep(3)
         else:
-            # REAL MODE: Capture real packets
-            print("=== SNIFFING PACKETS ===", flush=True)
-            clean_stale_flows()
+            _evict_stale_flows()
             try:
-                packets = sniff(prn=newPacket, timeout=5)
-                print(f"Captured {len(packets)} packets", flush=True)
-            except Exception as e:
-                print(f"Sniff error: {e}", flush=True)
-            for f in list(current_flows.values()):
+                scapy_sniff(prn=_handle_packet, timeout=5)
+            except Exception:
+                log.exception("scapy sniff error")
+            with _state_lock:
+                snapshot = list(_current_flows.values())
+            for flow in snapshot:
                 try:
-                    classify(f.terminated())
-                except Exception as e:
+                    classify(flow.terminated())
+                except Exception:
                     pass
             time.sleep(1)
 
 
-@app.route('/start-sniff', methods=['GET'])
-def start_sniff():
-    global thread
-    if not thread.is_alive():
-        print(">>> MANUALLY STARTING SNIFF THREAD")
-        thread = socketio.start_background_task(snif_and_detect)
-    return jsonify({"status": "started"})
+def _ensure_sniff_thread() -> None:
+    global _thread
+    if not _thread.is_alive():
+        log.info("Starting sniff background task")
+        _thread = socketio.start_background_task(_sniff_loop)
 
-@app.route('/get-data', methods=['GET'])
-def get_data():
-    """Return test data for polling"""
-    import random
-    ip = '192.168.1.' + str(random.randint(1,10))
-    return jsonify({
-        'result': [1, ip, '80', '10.0.0.1', '443', 'tcp', 'Benign', '0.1'],
-        'ips': [{'SourceIP': ip, 'count': random.randint(1,10)}],
-        'risk_level': 'minimal',
-        'classification': 'Benign'
-    })
 
-@app.route('/test-emit', methods=['GET'])
-def test_emit():
-    """Test endpoint to emit data to socket"""
-    print(">>> TEST EMIT CALLED", flush=True)
-    socketio.emit('newresult', {
-        'result': [1, '192.168.1.1', '80', '10.0.0.1', '443', 'tcp', 'Benign', '0.1'],
-        'ips': [{'SourceIP': '192.168.1.1', 'count': 5}, {'SourceIP': '192.168.1.2', 'count': 3}],
-        'risk_level': 'minimal',
-        'classification': 'Benign'
-    }, namespace='/test')
-    return jsonify({"status": "emitted"})
+# ---------------------------------------------------------------------------
+# Before-request: flush Firestore queue while we have a session context
+# ---------------------------------------------------------------------------
 
-@app.route('/test-firebase', methods=['GET'])
-def test_firebase():
-    try:
-        if not firestore_db:
-            return jsonify({"status": "error", "message": "Firestore not initialized"}), 500
 
-        # Create document reference first
-        doc_ref = firestore_db.collection("connection_tests").document()
-        
-        # Prepare data WITHOUT SERVER_TIMESTAMP for the response
-        test_data = {
-            "test": "RNIDS Connection Test",
-            "status": "success",
-            "document_id": doc_ref.id
-        }
+@app.before_request
+def before_request():
+    if session.get("logged_in"):
+        _flush_firestore_queue()
 
-        # Create separate data for Firestore WITH timestamp
-        firestore_data = {
-            **test_data,
-            "timestamp": SERVER_TIMESTAMP  # Only for Firestore
-        }
 
-        # Write to Firestore
-        doc_ref.set(firestore_data)
-        
-        # Return response without the timestamp
-        return jsonify({
-            "status": "success",
-            "data": test_data
-        })
-        
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "error": str(e),
-            "solution": "Check firebase-adminsdk.json and Firestore rules"
-        }), 500
+# ---------------------------------------------------------------------------
+# Routes — authentication
+# ---------------------------------------------------------------------------
 
-# Route for the landing page (default page)
-@app.route('/')
+
+@app.route("/")
 def landing():
-    return render_template('landing.html')
+    return render_template("landing.html")
 
 
-# Route for handling login form submission
-@app.route('/login', methods=['POST'])
+@app.route("/login", methods=["POST"])
 def login():
-    try:
-        # Get username and password from form or JSON
-        if request.is_json:
-            data = request.get_json()
-            username = data.get('username')
-            password = data.get('password')
-        else:
-            username = request.form.get('username')
-            password = request.form.get('password')
+    ajax = _is_ajax()
 
-        # Add debug logging to track flow
-        print(f"Login attempt for username: {username}")
-        
-        # Check if request is AJAX (XHR)
-        is_ajax = request.headers.get('X-Requested-With') == 'XMLHttpRequest'
-        
-        # Basic validation
+    try:
+        data = request.get_json(silent=True) or {}
+        username = (data.get("username") or request.form.get("username", "")).strip()
+        password = data.get("password") or request.form.get("password", "")
+
         if not username or not password:
-            error_msg = "Username and password are required"
-            print(f"Login error: {error_msg}")
-            if is_ajax:
-                return jsonify({"success": False, "message": error_msg}), 400
-            flash(error_msg)
-            return redirect(url_for('landing'))
-        
-        # Check Firestore availability BEFORE attempting any Firestore access
+            msg = "Username and password are required."
+            return (
+                (jsonify({"success": False, "message": msg}), 400)
+                if ajax
+                else (flash(msg) or redirect(url_for("landing")))
+            )
+
         if firestore_db is None:
-            error_msg = "Firebase not initialized. Unable to authenticate."
-            print(f"Login error: {error_msg}")
-            if is_ajax:
-                return jsonify({"success": False, "message": error_msg}), 503
-            flash(error_msg)
-            return redirect(url_for('landing'))
-            
-        # Try multiple lookup strategies
-        user_data = None
-        user_id = None
-        
-        # Strategy 1: Check if the input is an email (has @)
-        if '@' in username:
-            print("Email format detected, trying direct document lookup...")
-            user_ref = firestore_db.collection('users').document(username)
-            user_doc = user_ref.get()
-            if user_doc.exists:
-                user_data = user_doc.to_dict()
-                user_id = username
-                print(f"Found user via direct email lookup: {user_id}")
-        
-        # Strategy 2: Use the get_user_by_username function
+            msg = "Database unavailable. Try again later."
+            return (
+                (jsonify({"success": False, "message": msg}), 503)
+                if ajax
+                else (flash(msg) or redirect(url_for("landing")))
+            )
+
+        user_data, user_id = _resolve_user(username)
+
         if not user_data:
-            print("Trying username lookup via query...")
-            user_data, user_id = get_user_by_username(username)
-            if user_data:
-                print(f"Found user via username query: {user_id}")
-        
-        # Strategy 3: Try with @example.com appended if no @ in username
-        if not user_data and '@' not in username:
-            print("Trying email with default domain...")
-            email_to_try = f"{username}@example.com"
-            user_ref = firestore_db.collection('users').document(email_to_try)
-            user_doc = user_ref.get()
-            if user_doc.exists:
-                user_data = user_doc.to_dict()
-                user_id = email_to_try
-                print(f"Found user via default domain email: {user_id}")
-        
-        # Debug output for troubleshooting
-        if user_data:
-            print(f"User data retrieved. Has password hash: {'password_hash' in user_data}")
-        else:
-            print("No user data found with provided username/email")
-            
-        # Verify user exists and password matches
-        if not user_data:
-            error_msg = "User not found"
-            print(f"Login error: {error_msg}")
-            if is_ajax:
-                return jsonify({"success": False, "message": "Invalid username or password"}), 401
-            flash("Invalid username or password")
-            return redirect(url_for('landing'))
-            
-        # Check if password hash exists
-        if 'password_hash' not in user_data:
-            error_msg = "Password hash not found in user data"
-            print(f"Login error: {error_msg}")
-            if is_ajax:
-                return jsonify({"success": False, "message": "Account setup incomplete. Please contact admin."}), 401
-            flash("Account setup incomplete. Please contact admin.")
-            return redirect(url_for('landing'))
-            
-        # Verify password
-        if not verify_password(user_data.get('password_hash'), password):
-            error_msg = "Password verification failed"
-            print(f"Login error: {error_msg}")
-            if is_ajax:
-                return jsonify({"success": False, "message": "Invalid username or password"}), 401
-            flash("Invalid username or password")
-            return redirect(url_for('landing'))
-            
-        # Authentication successful
-        print(f"User {username} authenticated successfully")
-        
-        # User authenticated, set up session
-        session['logged_in'] = True
-        session['username'] = user_data.get('username', username)
-        session['user_id'] = user_id
-        session['email'] = user_data.get('email', user_id if '@' in user_id else f"{user_id}@example.com")
-        session['fullname'] = user_data.get('fullname', '')
-        session['new_session'] = True
+            return _auth_fail(ajax, "Invalid username or password.", 401)
 
-        # Get device info
-        user_agent = request.user_agent
-        device_info = {
-            'os': user_agent.platform if user_agent else 'Unknown',
-            'browser': user_agent.browser if user_agent else 'Unknown',
-            'ip_address': request.remote_addr or '0.0.0.0'
-        }
-        
-        # Create Firestore session
-        session_id = create_user_session(user_id, device_info)
-        if session_id:
-            session['session_id'] = session_id
-            print(f"Created Firestore session: {session_id}")
-            
-            # Initialize global stats
-            update_global_stats()
-        else:
-            session['session_id'] = 'default_session'
-            print("Using default session ID")
-        
-        # Return appropriate response based on request format
-        if is_ajax:
-            return jsonify({"success": True, "redirect": url_for('capture')})
-        
-        # Start sniffing thread after login
-        print(f">>> Thread status: {thread.is_alive()}")
-        if not thread.is_alive():
-            print(">>> STARTING SNIFF THREAD NOW!!!")
-            thread = socketio.start_background_task(snif_and_detect)
-        else:
-            print(">>> THREAD ALREADY RUNNING")
-        
-        # Send immediate test data to verify connection
-        socketio.emit('newresult', {
-            'result': [1, '192.168.1.1', '80', '10.0.0.1', '443', 'tcp', 'Benign', '0.1'],
-            'ips': [{'SourceIP': '192.168.1.1', 'count': 5}],
-            'risk_level': 'minimal',
-            'classification': 'Benign'
-        }, namespace='/test')
-        print(">>> IMMEDIATE TEST DATA SENT", flush=True)
-        
-        return redirect(url_for('capture'))
-        
-    except Exception as e:
-        print(f"Login error: {e}")
-        traceback.print_exc()
-        is_ajax = request.headers.get('X-Requested-With') == 'XMLHttpRequest'
-        if is_ajax:
-            return jsonify({"success": False, "message": "Login failed. Please try again."}), 500
-        flash('Login failed. Please try again.')
-        return redirect(url_for('landing'))
-    
+        if "password_hash" not in user_data:
+            return _auth_fail(ajax, "Account setup incomplete. Contact admin.", 401)
 
-# Route for the capture page (index.html)
-@app.route('/capture')
-def capture():
-    # Check if the user is logged in
-    if not session.get('logged_in'):
-        return redirect(url_for('landing'))  # Redirect to landing page if not logged in
-    return render_template('index.html')
+        if not verify_password(user_data["password_hash"], password):
+            return _auth_fail(ajax, "Invalid username or password.", 401)
 
-# Route for the signup page
-@app.route('/signup', methods=['GET', 'POST'])
-def signup():
-    if request.method == 'GET':
-        return render_template('signup.html')
-    
-    # Check if the request is AJAX
-    is_ajax = request.headers.get('X-Requested-With') == 'XMLHttpRequest'
-    
-    try:
-        # Get form data
-        username = request.form.get('username', '').strip()
-        password = request.form.get('password', '')
-        email = request.form.get('email', '').strip()
-        fullname = request.form.get('fullname', '').strip()
-        
-        # Validation errors dictionary
-        errors = {}
-        
-        # Validate input
-        if not username:
-            errors['username'] = 'Username is required'
-        if not password:
-            errors['password'] = 'Password is required'
-        if not email:
-            errors['email'] = 'Email is required'
-        
-        # Handle validation errors
-        if errors:
-            if is_ajax:
-                return jsonify({"success": False, "errors": errors}), 400
-            for field, message in errors.items():
-                flash(message)
-            return render_template('signup.html')
-        
-        # Fail fast if Firestore is unavailable
-        if firestore_db is None:
-            error_msg = "Firebase not initialized. Unable to create account."
-            print(f"Signup error: {error_msg}")
-            if is_ajax:
-                return jsonify({"success": False, "message": error_msg}), 503
-            flash(error_msg)
-            return render_template('signup.html')
+        _setup_session(user_data, user_id)
+        _ensure_sniff_thread()
 
-        # Check if email contains @ - if not, add default domain
-        if '@' not in email:
-            email = f"{email}@example.com"
-        
-        # Check if username already exists
-        existing_user, _ = get_user_by_username(username)
-        if existing_user:
-            if is_ajax:
-                return jsonify({"success": False, "errors": {"username": "Username already exists"}}), 400
-            flash('Username already exists')
-            return render_template('signup.html')
-        
-        # Check if email already exists as a document ID
-        user_ref = firestore_db.collection('users').document(email)
-        if user_ref.get().exists:
-            if is_ajax:
-                return jsonify({"success": False, "errors": {"email": "Email already registered"}}), 400
-            flash('Email already registered')
-            return render_template('signup.html')
-        
-        # Hash password
-        password_hash = hash_password(password)
-        if not password_hash:
-            if is_ajax:
-                return jsonify({"success": False, "message": "Error creating account. Please try again."}), 500
-            flash('Error creating account. Please try again.')
-            return render_template('signup.html')
-        
-        # Create user document
-        user_data = {
-            'username': username,
-            'email': email,
-            'fullname': fullname if fullname else username,
-            'password_hash': password_hash,
-            'created_at': SERVER_TIMESTAMP,
-            'last_active': SERVER_TIMESTAMP
-        }
-        
-        # Save to Firestore
-        user_ref.set(user_data)
-        
-        # Log success
-        print(f"User created: {email} with username: {username}")
-        
-        # Automatically log in the user
-        session['logged_in'] = True
-        session['username'] = username
-        session['user_id'] = email
-        session['email'] = email
-        session['fullname'] = fullname if fullname else username
-        session['new_session'] = True
-        
-        # Create session
-        session_id = create_user_session(email)
-        if session_id:
-            session['session_id'] = session_id
-        
-        # Return appropriate response
-        if is_ajax:
-            return jsonify({"success": True, "redirect": url_for('capture')})
-        
-        flash('Account created successfully!')
-        return redirect(url_for('capture'))
-        
-    except Exception as e:
-        print(f"Signup error: {e}")
-        traceback.print_exc()
-        
-        if is_ajax:
-            return jsonify({"success": False, "message": "Error creating account. Please try again."}), 500
-        
-        flash('Error creating account. Please try again.')
-        return render_template('signup.html')
-
-# Route for the detail page (Detail.html)
-@app.route('/detail')
-def detail():
-    try:
-        flow_id = request.args.get('flow_id', default=-1, type=int)
-        flow = flow_df.loc[flow_df['FlowID'] == flow_id]
-        
-        if flow.empty:
-            return "Flow not found", 404
-            
-        X = [flow.values[0,1:40]]
-        choosen_instance = X
-        proba_score = list(predict_fn_rf(choosen_instance))
-        risk_proba = sum(proba_score[0][1:])
-        
-        if risk_proba > 0.8:
-            risk = "Risk: <p style=\"color:red;\">Very High</p>"
-        elif risk_proba > 0.6:
-            risk = "Risk: <p style=\"color:orangered;\">High</p>"
-        elif risk_proba > 0.4:
-            risk = "Risk: <p style=\"color:orange;\">Medium</p>"
-        elif risk_proba > 0.2:
-            risk = "Risk: <p style=\"color:green;\">Low</p>"
-        else:
-            risk = "Risk: <p style=\"color:limegreen;\">Minimal</p>"
-            
-        exp = explainer.explain_instance(choosen_instance[0], predict_fn_rf, num_features=6, top_labels=1)
-
-        X_transformed = ae_scaler.transform(X)
-        reconstruct = ae_model.predict(X_transformed)
-        err = reconstruct - X_transformed
-        abs_err = np.absolute(err)
-        
-        ind_n_abs_largest = np.argpartition(abs_err, -5)[-5:]
-        col_n_largest = ae_features[ind_n_abs_largest]
-        err_n_largest = err[0][ind_n_abs_largest]
-        
-        fig = {
-            "data": [{
-                "type": "bar",
-                "x": col_n_largest[0].tolist(),
-                "y": err_n_largest[0].tolist()
-            }],
-            "layout": {"title": "Reconstruction Error"}
-        }
-        plot_div = plotly.io.to_html(fig, include_plotlyjs=False, full_html=False)
-
-        return render_template(
-            'detail.html',
-            tables=[flow.reset_index(drop=True).transpose().to_html(classes='data')],
-            exp=exp.as_html(),
-            ae_plot=plot_div,
-            risk=risk
+        log.info("User %s logged in", username)
+        return (
+            jsonify({"success": True, "redirect": url_for("capture")})
+            if ajax
+            else redirect(url_for("capture"))
         )
-    except Exception as e:
-        print(f"Error in flow_detail: {str(e)}")
-        traceback.print_exc()
-        return "Error processing request", 500
 
-# Route for the profile page
-@app.route('/profile')
-def profile():
-    if not session.get('logged_in'):
-        return redirect(url_for('landing'))
-    
-    # Fetch user details from the session or database
-    username = session.get('username')
-    email = session.get('email')  # Ensure email is stored in the session during login/signup
-    fullname = session.get('fullname')  # Ensure fullname is stored in the session during signup
-    
-    return render_template('profile.html', username=username, email=email, fullname=fullname)
+    except Exception:
+        log.exception("Login error")
+        return _auth_fail(ajax, "Login failed. Please try again.", 500)
 
-@app.route('/clear-local-flows')
-def clear_local_flows():
-    if not session.get('logged_in'):
-        return jsonify({"status": "error", "message": "Not authorized"}), 401
-    return jsonify({"status": "success", "message": "Local flows cleared"})
 
-# Add this route to your application.py file
-@app.route('/debug_auth', methods=['GET'])
-def debug_auth():
-    """Debug route for authentication issues (remove in production)"""
-    # Only allow on development environment
-    if app.config.get('ENV') != 'development':
-        return jsonify({"error": "Not available in production"}), 403
-    
+def _resolve_user(username: str) -> tuple[dict | None, str | None]:
+    """Try multiple lookup strategies; return (user_data, user_id) or (None, None)."""
+    # Email lookup by document ID
+    if "@" in username:
+        doc = firestore_db.collection("users").document(username).get()
+        if doc.exists:
+            return doc.to_dict(), username
+
+    # Username query
+    user_data, user_id = get_user_by_username(username)
+    if user_data:
+        return user_data, user_id
+
+    # Fallback: append default domain
+    if "@" not in username:
+        email = f"{username}@example.com"
+        doc = firestore_db.collection("users").document(email).get()
+        if doc.exists:
+            return doc.to_dict(), email
+
+    return None, None
+
+
+def _setup_session(user_data: dict, user_id: str) -> None:
+    session.clear()
+    session["logged_in"] = True
+    session["username"] = user_data.get("username", user_id)
+    session["user_id"] = user_id
+    session["email"] = user_data.get("email", user_id)
+    session["fullname"] = user_data.get("fullname", "")
+    session["new_session"] = True
+
+    ua = request.user_agent
+    device_info = {
+        "os": ua.platform if ua else "Unknown",
+        "browser": ua.browser if ua else "Unknown",
+        "ip_address": request.remote_addr or "0.0.0.0",
+    }
+    sid = create_user_session(user_id, device_info)
+    session["session_id"] = sid or "default_session"
     try:
-        # Check if a username is provided
-        test_username = request.args.get('username')
-        if not test_username:
-            return jsonify({
-                "status": "Need username parameter",
-                "usage": "/debug_auth?username=your_username"
-            })
-        
-        # Try to find the user
-        user_data, user_id = get_user_by_username(test_username)
-        
-        # If not found by username, try email
-        if not user_data and '@' not in test_username:
-            email_to_try = f"{test_username}@example.com"
-            user_ref = firestore_db.collection('users').document(email_to_try)
-            user_doc = user_ref.get()
-            if user_doc.exists:
-                user_data = user_doc.to_dict()
-                user_id = email_to_try
-        
-        # Prepare response
-        if not user_data:
-            return jsonify({
-                "status": "User not found",
-                "username": test_username,
-                "lookups_tried": [
-                    f"Username match: {test_username}",
-                    f"Email direct: {test_username if '@' in test_username else f'{test_username}@example.com'}"
-                ]
-            })
-        
-        # Return user info (redact sensitive data)
-        safe_data = {
-            "status": "User found",
-            "username": user_data.get('username'),
-            "user_id": user_id,
-            "email": user_data.get('email'),
-            "has_password_hash": 'password_hash' in user_data,
-            "password_hash_length": len(user_data.get('password_hash', '')) if 'password_hash' in user_data else 0,
-            "created_at": user_data.get('created_at').strftime('%Y-%m-%d %H:%M:%S') if user_data.get('created_at') else None,
-            "last_active": user_data.get('last_active').strftime('%Y-%m-%d %H:%M:%S') if user_data.get('last_active') else None
-        }
-        
-        return jsonify(safe_data)
-    except Exception as e:
-        return jsonify({
-            "status": "Error",
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        })
+        update_global_stats()
+    except Exception:
+        pass
 
 
-@app.route('/about')
-def about():
-    return render_template('about.html')
+def _auth_fail(ajax: bool, msg: str, status: int):
+    if ajax:
+        return jsonify({"success": False, "message": msg}), status
+    flash(msg)
+    return redirect(url_for("landing"))
 
-# Logout route
-@app.route('/logout')
+
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
+    if request.method == "GET":
+        return render_template("signup.html")
+
+    ajax = _is_ajax()
+    try:
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        email = request.form.get("email", "").strip()
+        fullname = request.form.get("fullname", "").strip()
+
+        errors = {}
+        if not username:
+            errors["username"] = "Username is required."
+        if not password:
+            errors["password"] = "Password is required."
+        if not email:
+            errors["email"] = "Email is required."
+
+        if errors:
+            if ajax:
+                return jsonify({"success": False, "errors": errors}), 400
+            for msg in errors.values():
+                flash(msg)
+            return render_template("signup.html")
+
+        if firestore_db is None:
+            msg = "Database unavailable. Try again later."
+            if ajax:
+                return jsonify({"success": False, "message": msg}), 503
+            flash(msg)
+            return render_template("signup.html")
+
+        if "@" not in email:
+            email = f"{email}@example.com"
+
+        existing, _ = get_user_by_username(username)
+        if existing:
+            err = {"username": "Username already taken."}
+            if ajax:
+                return jsonify({"success": False, "errors": err}), 400
+            flash(err["username"])
+            return render_template("signup.html")
+
+        if firestore_db.collection("users").document(email).get().exists:
+            err = {"email": "Email already registered."}
+            if ajax:
+                return jsonify({"success": False, "errors": err}), 400
+            flash(err["email"])
+            return render_template("signup.html")
+
+        pw_hash = hash_password(password)
+        if not pw_hash:
+            msg = "Error creating account. Please try again."
+            if ajax:
+                return jsonify({"success": False, "message": msg}), 500
+            flash(msg)
+            return render_template("signup.html")
+
+        firestore_db.collection("users").document(email).set(
+            {
+                "username": username,
+                "email": email,
+                "fullname": fullname or username,
+                "password_hash": pw_hash,
+                "created_at": SERVER_TIMESTAMP,
+                "last_active": SERVER_TIMESTAMP,
+            }
+        )
+        log.info("New user created: %s (%s)", username, email)
+
+        _setup_session(
+            {"username": username, "email": email, "fullname": fullname}, email
+        )
+
+        if ajax:
+            return jsonify({"success": True, "redirect": url_for("capture")})
+        flash("Account created successfully!")
+        return redirect(url_for("capture"))
+
+    except Exception:
+        log.exception("Signup error")
+        msg = "Error creating account. Please try again."
+        if ajax:
+            return jsonify({"success": False, "message": msg}), 500
+        flash(msg)
+        return render_template("signup.html")
+
+
+@app.route("/logout")
 def logout():
     try:
-        # End Firestore session if exists
-        if session.get('user_id') and session.get('session_id') and firestore_db:
-            session_ref = firestore_db.collection('sessions').document(session['session_id'])
-            session_ref.update({
-                'end_time': SERVER_TIMESTAMP,
-                'status': 'completed'
-            })
-    except Exception as e:
-        print(f"Error ending session: {e}")
-    
-    # Clear the session
+        if firestore_db and session.get("session_id"):
+            firestore_db.collection("sessions").document(session["session_id"]).update(
+                {"end_time": SERVER_TIMESTAMP, "status": "completed"}
+            )
+    except Exception:
+        log.exception("Error ending Firestore session")
     session.clear()
-    
-    # Return a response that will trigger frontend cleanup
-    return redirect(url_for('landing'))
+    return redirect(url_for("landing"))
 
-@app.route('/check-session')
+
+# ---------------------------------------------------------------------------
+# Routes — main app pages
+# ---------------------------------------------------------------------------
+
+
+def _require_login():
+    if not session.get("logged_in"):
+        return redirect(url_for("landing"))
+    return None
+
+
+@app.route("/capture")
+def capture():
+    return _require_login() or render_template("index.html")
+
+
+@app.route("/profile")
+def profile():
+    return _require_login() or render_template(
+        "profile.html",
+        username=session.get("username"),
+        email=session.get("email"),
+        fullname=session.get("fullname"),
+    )
+
+
+@app.route("/about")
+def about():
+    return render_template("about.html")
+
+
+@app.route("/detail")
+def detail():
+    flow_id = request.args.get("flow_id", default=-1, type=int)
+    with _state_lock:
+        flow = _flow_df.loc[_flow_df["FlowID"] == flow_id]
+
+    if flow.empty:
+        return "Flow not found", 404
+
+    try:
+        X = [flow.values[0, 1:40]]
+        proba = predict_proba(X)
+        risk_proba = float(sum(proba[0, 1:]))
+        risk_level, risk_label = _risk_for_score(risk_proba)
+
+        COLOR_MAP = {
+            "very_high": "red",
+            "high": "orangered",
+            "medium": "orange",
+            "low": "green",
+            "minimal": "limegreen",
+        }
+        risk_html = f'Risk: <p style="color:{COLOR_MAP[risk_level]};">{risk_label}</p>'
+
+        exp = MODELS["explainer"].explain_instance(
+            X[0], predict_proba, num_features=6, top_labels=1
+        )
+
+        ae_model = MODELS["ae_model"]
+        if ae_model is not None:
+            X_t = MODELS["ae_scaler"].transform(X)
+            recon = ae_model.predict(X_t)
+            err = recon - X_t
+            abs_err = np.abs(err)
+            top5_idx = np.argpartition(abs_err[0], -5)[-5:]
+            fig = {
+                "data": [
+                    {
+                        "type": "bar",
+                        "x": AE_FEATURES[top5_idx].tolist(),
+                        "y": err[0][top5_idx].tolist(),
+                    }
+                ],
+                "layout": {"title": "Reconstruction Error (Top 5 Features)"},
+            }
+            ae_plot = plotly.io.to_html(fig, include_plotlyjs=False, full_html=False)
+        else:
+            ae_plot = "<p>Autoencoder unavailable.</p>"
+
+        return render_template(
+            "detail.html",
+            tables=[flow.reset_index(drop=True).transpose().to_html(classes="data")],
+            exp=exp.as_html(),
+            ae_plot=ae_plot,
+            risk=risk_html,
+        )
+    except Exception:
+        log.exception("Error in detail view")
+        return "Error processing request", 500
+
+
+# ---------------------------------------------------------------------------
+# Routes — API / utility
+# ---------------------------------------------------------------------------
+
+
+@app.route("/start-sniff")
+def start_sniff():
+    _ensure_sniff_thread()
+    return jsonify({"status": "started"})
+
+
+@app.route("/check-session")
 def check_session():
-    if not session.get('logged_in'):
-        return "Not logged in"
-    return jsonify({
-        'username': session.get('username'),
-        'user_id': session.get('user_id'),
-        'session_id': session.get('session_id')
-    })
+    if not session.get("logged_in"):
+        return jsonify({"logged_in": False}), 401
+    return jsonify(
+        {
+            "logged_in": True,
+            "username": session.get("username"),
+            "user_id": session.get("user_id"),
+            "session_id": session.get("session_id"),
+        }
+    )
 
 
-@socketio.on('connect', namespace='/test')
-def test_connect():
-    global thread
-    import sys
-    print('=== CLIENT CONNECTED ===', flush=True)
-    socketio.emit('message', {'status': 'connected', 'msg': 'Server ready!'}, namespace='/test')
+@app.route("/clear-local-flows")
+def clear_local_flows():
+    if not session.get("logged_in"):
+        return jsonify({"status": "error", "message": "Not authorized"}), 401
+    return jsonify({"status": "success"})
 
-    if not thread.is_alive():
-        print('=== STARTING SNIFF THREAD ===', flush=True)
-        thread = socketio.start_background_task(snif_and_detect)
 
-@socketio.on('disconnect', namespace='/test')
-def test_disconnect():
+@app.route("/test-firebase")
+def test_firebase():
+    if not firestore_db:
+        return jsonify({"status": "error", "message": "Firestore not initialized"}), 500
     try:
-        print('Client disconnected')
-    except Exception as e:
-        print(f"Error in disconnect handler: {str(e)}")
+        doc_ref = firestore_db.collection("connection_tests").document()
+        doc_ref.set({"test": "RNIDS Connection Test", "timestamp": SERVER_TIMESTAMP})
+        return jsonify({"status": "success", "document_id": doc_ref.id})
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 500
 
-# Cleanup handler for when the application shuts down
-def cleanup_on_shutdown():
-    try:
-        thread_stop_event.set()
-        cleanup_files()
-        # Clean up any remaining flows
-        for flow_id in list(current_flows.keys()):
+
+@app.route("/test-emit")
+def test_emit():
+    socketio.emit(
+        "newresult",
+        {
+            "result": [
+                1,
+                "192.168.1.1",
+                "80",
+                "10.0.0.1",
+                "443",
+                "tcp",
+                "Benign",
+                "0.1",
+            ],
+            "ips": [{"SourceIP": "192.168.1.1", "count": 5}],
+            "risk_level": "minimal",
+            "classification": "Benign",
+        },
+        namespace="/test",
+    )
+    return jsonify({"status": "emitted"})
+
+
+@app.route("/debug-auth")
+def debug_auth():
+    """Development-only auth debugger. Disabled in production via env var."""
+    if not app.config["DEBUG"]:
+        return jsonify({"error": "Not available in production"}), 403
+
+    username = request.args.get("username")
+    if not username:
+        return jsonify({"usage": "/debug-auth?username=<name>"})
+
+    user_data, user_id = _resolve_user(username)
+    if not user_data:
+        return jsonify({"status": "not_found", "username": username})
+
+    return jsonify(
+        {
+            "status": "found",
+            "username": user_data.get("username"),
+            "user_id": user_id,
+            "email": user_data.get("email"),
+            "has_password_hash": "password_hash" in user_data,
+            "password_hash_length": len(user_data.get("password_hash", "")),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# SocketIO events
+# ---------------------------------------------------------------------------
+
+
+@socketio.on("connect", namespace="/test")
+def on_connect():
+    log.info("Client connected")
+    socketio.emit(
+        "message", {"status": "connected", "msg": "Server ready!"}, namespace="/test"
+    )
+    _ensure_sniff_thread()
+
+
+@socketio.on("disconnect", namespace="/test")
+def on_disconnect():
+    log.info("Client disconnected")
+
+
+# ---------------------------------------------------------------------------
+# Shutdown cleanup
+# ---------------------------------------------------------------------------
+
+
+def _shutdown():
+    log.info("Shutting down — cleaning up flows")
+    _thread_stop.set()
+    with _state_lock:
+        for fid, flow in list(_current_flows.items()):
             try:
-                classify(current_flows[flow_id].terminated())
-                del current_flows[flow_id]
-            except Exception as e:
-                print(f"Error cleaning up flow {flow_id}: {str(e)}")
-    except Exception as e:
-        print(f"Error during shutdown cleanup: {str(e)}")
+                classify(flow.terminated())
+            except Exception:
+                pass
+            del _current_flows[fid]
+    _close_logs()
 
-# Register the cleanup handler
-atexit.register(cleanup_on_shutdown)
 
-if __name__ == '__main__':
+atexit.register(_shutdown)
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
     try:
-        socketio.run(app, allow_unsafe_werkzeug=True, port=8080)
-    except Exception as e:
-        print(f"Error starting application: {str(e)}")
-        cleanup_on_shutdown()
+        socketio.run(app, allow_unsafe_werkzeug=True, port=5050)
+    except Exception:
+        log.exception("Fatal error starting application")
+        _shutdown()
